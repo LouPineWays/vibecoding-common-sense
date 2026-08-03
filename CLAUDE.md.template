@@ -1,0 +1,112 @@
+# Project rules for AI coding agents
+
+This file is read automatically by Claude Code (`CLAUDE.md`) at the start of every session
+in this repo. If you also use Codex, copy or symlink this same content to `AGENTS.md` —
+Codex reads that file the way Claude Code reads this one. Keep the two in sync; a rule that
+exists in only one place will silently not apply when the other agent is driving.
+
+Everything below is a starting point pulled from a real production repo, then stripped of
+anything project-specific. Delete what doesn't apply, keep what does, and add your own
+house rules under a new heading as you discover them — the value of this file grows every
+time an agent does something surprising and you write down the rule that would have
+prevented it.
+
+---
+
+## Git & PR workflow
+
+**Always branch from the remote default branch, never from whatever is currently checked
+out.**
+
+```
+git fetch origin main && git checkout -b <your-branch> origin/main
+```
+
+`git checkout -b <name>` with no start point branches from the current `HEAD`. If you (or a
+parallel agent session, or a past version of yourself from an hour ago) left another
+branch checked out, your new branch silently inherits all of its unmerged commits as
+ancestors. If the repo squash-merges, that other work rides along inside your PR:
+unreviewed, never tested on its own, and credited to a commit message describing something
+else entirely.
+
+Before pushing, verify with `git log --oneline origin/main..HEAD` — it should list only
+your own commits. If it lists more, you branched from the wrong place; stop and fix the
+base before pushing.
+
+**Never commit directly to the default branch.** This matters even more if more than one
+agent or person might touch this working directory — confirm the current branch
+(`git branch --show-current`) before committing rather than assuming.
+
+**"Merge when ready" means merge after CI reports green, not immediately on PR creation.**
+Before merging, check that every required status check has actually passed — don't guess
+from the PR being open a while, and don't assume a failure is something transient like
+quota without reading the actual failure log.
+
+**If you're running multiple agents in parallel on the same repo** (e.g. Claude Code and
+Codex both making changes), give each one its own branch or worktree so they don't collide
+in the same working tree. When consolidating their work back together, cherry-pick specific
+commits onto a fresh branch from the remote default rather than `git merge`-ing one agent's
+branch into another's — merging drags in that branch's full history and can trip
+pre-push hooks that expect a linear, reviewed set of commits.
+
+If you discover a branch, stash, or set of uncommitted changes you don't recognize,
+investigate before deleting or overwriting it — it may be another session's in-progress
+work. Prefer a reversible move (stash, rename, set aside) over a destructive one.
+
+## Status: check, don't read
+
+Status prose (README badges, a "done" section in a doc, a comment claiming something is
+implemented) drifts out of sync with reality constantly, because nobody remembers to update
+it every time the code changes. Treat it as a hint, never as a source of truth. For
+anything shippable, `git log` and the actual code are authoritative — a doc that disagrees
+with them is the thing that's wrong, not the code.
+
+If your project tracks a backlog or status file, prefer one where claims are falsifiable:
+a "done" entry that cites a specific commit or PR, ideally checked by a script in CI,
+beats a checkbox someone ticked by hand and never revisited.
+
+## Safety and file operations
+
+Never delete or overwrite a file, folder, or branch without first confirming the exact
+target path or ref with the user — "clean this up" is not the same as "delete
+`/exact/path`". If your project has data that must never be touched by an agent (a media
+folder, a user database dump, anything genuinely irreplaceable), say so explicitly here,
+by name, with no exceptions — don't rely on the agent inferring it's off-limits.
+
+Before any command that could discard uncommitted work (`git checkout --`, `git restore`,
+`git reset --hard`, `git clean`, `rm -rf` inside the repo), run `git status` first and stash
+or commit anything that's there.
+
+## House style, by example
+
+Codify small, repeatable conventions here so an agent doesn't have to be told twice. One
+real example, so you can see the pattern: a team that decided user-facing copy should never
+contain an em dash wrote it as a standing rule (`Em dashes are radioactive in user-facing
+copy — never use one in a string a reader sees. This does not apply to code comments,
+which may still use them freely.`) instead of correcting it in every PR review. Whatever
+your own repeated corrections are — naming conventions, a banned pattern, a required check
+before a certain kind of change — write them here the same way, as a rule with a reason,
+not just a reminder.
+
+## Multi-agent collaboration
+
+If you use more than one AI coding tool against this repo (Claude Code, Codex, others),
+decide and write down who's better suited to what, rather than re-deciding it every time:
+
+- One agent as the primary driver for anything needing full project context or multi-file
+  changes.
+- A second agent (if it has capabilities the first doesn't — e.g. image generation, or a
+  genuinely independent perspective for review) for self-contained tasks and adversarial
+  second-opinion review.
+
+**A second, independent reviewer on every PR that touches real application code is worth
+defaulting to, not reserving for changes that look risky at a glance.** A routine-looking
+PR is exactly the kind that slips through unreviewed — plenty of real projects have shipped
+a PR with zero review that turned out to carry several correctness bugs, caught only in a
+retrospective sweep well after release. Skip the extra review only for changes that can't
+ship a user-facing bug (docs, tooling config, content edits).
+
+When kicking off a task on a second agent, give it purpose and hard constraints, let it
+propose its own plan, review the plan before it touches code, then review the diff after —
+and still verify its claims independently before merging, the same as you would for a
+change you wrote yourself.
