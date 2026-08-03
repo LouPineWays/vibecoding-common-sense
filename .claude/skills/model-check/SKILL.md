@@ -69,8 +69,9 @@ tier for:
 Poor fits: anything needing sustained multi-file reasoning in one continuous session,
 exploratory/ambiguous work that benefits from conversational back-and-forth, or any
 decision that's really the user's to make. If a second agent runs a task in parallel with
-an active session on the same repo, it should use a separate branch or worktree so the two
-don't collide in the same working tree.
+an active session on the same repo, it should use a separate worktree or clone, not just a
+separate branch — a shared working directory can only have one branch checked out at a
+time, so two concurrent processes in it can still overwrite each other's files.
 
 Check this fit *before* running the model/effort scoring below — if the task is clearly a
 second-agent-shaped task, say so up front. This doesn't replace the primary-model

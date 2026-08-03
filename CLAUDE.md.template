@@ -15,12 +15,26 @@ prevented it.
 
 ## Git & PR workflow
 
+**First, confirm your repo's actual default branch.** Plenty of repos still use `master`,
+`trunk`, or something else instead of `main` — run `git remote show origin | grep 'HEAD
+branch'` (or check your Git host's settings) and use the real name everywhere below.
+`main` in these examples is a placeholder, not an assumption about your repo.
+
+**Check for uncommitted local changes before creating a branch, not just before destroying
+one.** `git status`. `git checkout -b` carries any uncommitted changes in the working tree
+onto the new branch — if those belong to something else (a parallel session's in-progress
+edit, work you forgot was open), they ride along into your new branch and its eventual
+commit. Commit, stash, or explicitly account for anything `git status` shows before you
+branch, not only before a destructive command.
+
 **Always branch from the remote default branch, never from whatever is currently checked
 out.**
 
 ```
 git fetch origin main && git checkout -b <your-branch> origin/main
 ```
+
+(swap `main` for your repo's real default branch, confirmed above)
 
 `git checkout -b <name>` with no start point branches from the current `HEAD`. If you (or a
 parallel agent session, or a past version of yourself from an hour ago) left another
@@ -29,9 +43,9 @@ ancestors. If the repo squash-merges, that other work rides along inside your PR
 unreviewed, never tested on its own, and credited to a commit message describing something
 else entirely.
 
-Before pushing, verify with `git log --oneline origin/main..HEAD` — it should list only
-your own commits. If it lists more, you branched from the wrong place; stop and fix the
-base before pushing.
+Before pushing, verify with `git log --oneline origin/main..HEAD` (same substitution) — it
+should list only your own commits. If it lists more, you branched from the wrong place;
+stop and fix the base before pushing.
 
 **Never commit directly to the default branch.** This matters even more if more than one
 agent or person might touch this working directory — confirm the current branch
@@ -42,12 +56,17 @@ Before merging, check that every required status check has actually passed — d
 from the PR being open a while, and don't assume a failure is something transient like
 quota without reading the actual failure log.
 
-**If you're running multiple agents in parallel on the same repo** (e.g. Claude Code and
-Codex both making changes), give each one its own branch or worktree so they don't collide
-in the same working tree. When consolidating their work back together, cherry-pick specific
-commits onto a fresh branch from the remote default rather than `git merge`-ing one agent's
-branch into another's — merging drags in that branch's full history and can trip
-pre-push hooks that expect a linear, reviewed set of commits.
+**If you're running multiple agents in parallel against the same repo** (e.g. Claude Code
+and Codex both making changes at the same time), give each one its own worktree or clone —
+not just its own branch. A single working directory can only have one branch checked out
+at a time; two concurrent processes sharing that directory will still read and write the
+same files no matter which branch each one thinks it's on, and can overwrite or interleave
+each other's edits. `git worktree add ../agent-2 -b <branch> origin/main` gets you an
+isolated working directory on its own branch without a second full clone. When
+consolidating their work back together, cherry-pick specific commits onto a fresh branch
+from the remote default rather than `git merge`-ing one agent's branch into another's —
+merging drags in that branch's full history and can trip pre-push hooks that expect a
+linear, reviewed set of commits.
 
 If you discover a branch, stash, or set of uncommitted changes you don't recognize,
 investigate before deleting or overwriting it — it may be another session's in-progress
