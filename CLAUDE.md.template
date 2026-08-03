@@ -128,4 +128,6 @@ ship a user-facing bug (docs, tooling config, content edits).
 When kicking off a task on a second agent, give it purpose and hard constraints, let it
 propose its own plan, review the plan before it touches code, then review the diff after —
 and still verify its claims independently before merging, the same as you would for a
-change you wrote yourself.
+change you wrote yourself. `scripts/watch-codex-review.sh <owner/repo> <pr-number>
+--trigger` (in this pack) requests that review and polls for the response instead of you
+checking back on the PR by hand.

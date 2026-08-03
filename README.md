@@ -23,6 +23,7 @@ exact words.
 | [`CLAUDE.md.template`](CLAUDE.md.template) | Drop-in project rules: branch-safety, "check don't read" for status claims, file-safety, house-style conventions, multi-agent review. Copy to `CLAUDE.md` (and `AGENTS.md` if you also run Codex) at your repo root. |
 | [`.claude/skills/model-check/`](.claude/skills/model-check/SKILL.md) | A skill that scores the task in front of you and recommends the cheapest model/effort tier that's still safe for it, instead of defaulting to the most expensive one out of habit. Includes an optional script for dispatching trivial tasks to a free local model. |
 | [`.claude/skills/humanize/`](.claude/skills/humanize/SKILL.md) | A checklist skill for stripping the statistical tells of AI-generated writing out of short public copy (store listings, pinned comments, changelog notes) before you publish it. |
+| [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
 
 ## Quickstart
 
@@ -54,6 +55,28 @@ instead of guessing:
 
 Then give me a one-paragraph summary of what you changed.
 ```
+
+## Waiting on a PR review
+
+If your `CLAUDE.md`'s multi-agent section has you requesting a second-opinion review on
+every PR (see `CLAUDE.md.template`, "Multi-agent collaboration"), you end up needing to
+check back on that PR a few minutes later to see if it responded. `scripts/watch-codex-review.sh`
+does that waiting for you:
+
+```
+./scripts/watch-codex-review.sh <owner/repo> <pr-number> --trigger
+```
+
+`--trigger` posts `@codex review` for you first; drop it if you already triggered the
+review yourself and just want to watch. It polls every 20 seconds (`--interval` to change
+that) for up to 15 minutes (`--timeout`) and exits the moment new review comments or a new
+review show up, printing a summary. Needs `gh` (authenticated) and `jq`.
+
+The script's own header comment explains the one bug worth knowing about if you write
+anything similar yourself: `gh api --jq <expr>` takes a single query-string argument and
+does not understand jq's own `--arg` flag, so bolting `--arg` onto a `gh api --jq` call
+silently mis-parses instead of erroring clearly. Pipe into the real `jq` binary instead
+whenever the filter needs a parameter.
 
 ## Why this exists
 

@@ -17,7 +17,7 @@ if ($File) {
     $Prompt = Get-Content -Raw -Path $File
 }
 
-if (-not $Prompt) {
+if (-not $Prompt -and [Console]::IsInputRedirected) {
     $Prompt = [Console]::In.ReadToEnd()
 }
 
@@ -37,7 +37,14 @@ try {
     $response = Invoke-RestMethod -Uri "http://localhost:11434/api/generate" -Method Post -Body $body -ContentType "application/json" -TimeoutSec 300
 }
 catch {
-    Write-Error "Could not reach local Ollama server at localhost:11434. Is it running? ($($_.Exception.Message))"
+    if ($_.Exception.Response) {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        $detail = $_.ErrorDetails.Message
+        Write-Error "Ollama returned HTTP $statusCode instead of a successful response.$(if ($detail) { " $detail" }) If this is a first run, check the model is pulled (e.g. 'ollama pull $Model')."
+    }
+    else {
+        Write-Error "Could not reach local Ollama server at localhost:11434. Is it running? ($($_.Exception.Message))"
+    }
     exit 1
 }
 
