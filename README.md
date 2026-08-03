@@ -64,6 +64,13 @@ setup, cleaned up and made generic. If you build on it, feel free to share what 
 the best version of a "common sense pack" is one that keeps absorbing other people's
 near-misses, not just the first one's.
 
+## About
+
+This came out of building [WordBurner](https://play.google.com/store/apps/details?id=com.loupineways.wordburner),
+a speed-reading app for Android — these rules earned their keep keeping that project from
+breaking every time an agent went off the rails. More at [wolfscairn.com](https://wolfscairn.com),
+or find me on Reddit as [u/Wolfscairn](https://www.reddit.com/user/Wolfscairn/).
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE). Use it, fork it, strip your own project's name into it, no
