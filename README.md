@@ -73,5 +73,7 @@ or find me on Reddit as [u/Wolfscairn](https://www.reddit.com/user/Wolfscairn/).
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Use it, fork it, strip your own project's name into it, no
-attribution required (though a link back is always appreciated).
+MIT — see [`LICENSE`](LICENSE). Use it, fork it, strip your own project's name into it. MIT
+only requires keeping the copyright and permission notice in the `LICENSE` file itself when
+you redistribute a substantial portion of this repo — beyond that, no separate credit or
+backlink is required (though one's always appreciated).
