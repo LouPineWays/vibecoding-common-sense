@@ -1,0 +1,4 @@
+# Generated at test-run time by scripts/test/run-tests.sh — never real
+# fixtures, safe to delete and regenerate any time.
+/scripts/test/fake-gh-bin/
+/scripts/test/.fake-gh-state/

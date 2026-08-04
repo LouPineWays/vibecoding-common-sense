@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Local, fast test matrix for watch-codex-review.sh, using fake-gh.sh instead
+# of the real GitHub API. Every scenario here used to require a real PR and
+# a real bot review to reproduce — several minutes of round-trip latency
+# per attempt. This runs the whole matrix in well under a minute.
+#
+# Usage: ./run-tests.sh
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WATCHER="$SCRIPT_DIR/../watch-codex-review.sh"
+FAKE_GH_DIR="$SCRIPT_DIR/fake-gh-bin"
+STATE_ROOT="$SCRIPT_DIR/.fake-gh-state"
+
+mkdir -p "$FAKE_GH_DIR"
+ln -sf "$SCRIPT_DIR/fake-gh.sh" "$FAKE_GH_DIR/gh"
+export PATH="$FAKE_GH_DIR:$PATH"
+
+PASS=0
+FAIL=0
+
+# run_case <name> <expected_exit> <must_contain_regex> -- <env assignments...>
+# The env assignments are exported, the watcher is run with a fresh
+# FAKE_GH_STATE_DIR, and the case passes if the exit code matches AND (if a
+# pattern was given) the combined stdout+stderr contains it.
+run_case() {
+  local name="$1" expected_exit="$2" must_contain="$3"
+  shift 3
+  [ "$1" = "--" ] && shift
+
+  local state_dir="$STATE_ROOT/$name"
+  rm -rf "$state_dir"
+  mkdir -p "$state_dir"
+
+  local out
+  out="$(env PATH="$PATH" FAKE_GH_STATE_DIR="$state_dir" "$@" \
+    bash "$WATCHER" fake/repo 1 "${EXTRA_ARGS[@]}" 2>&1)"
+  local actual_exit=$?
+
+  local ok=true
+  if [ "$actual_exit" -ne "$expected_exit" ]; then
+    ok=false
+  fi
+  if [ -n "$must_contain" ] && ! printf '%s' "$out" | grep -qiE "$must_contain"; then
+    ok=false
+  fi
+
+  if [ "$ok" = true ]; then
+    PASS=$((PASS + 1))
+    echo "PASS: $name"
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $name (exit=$actual_exit, expected=$expected_exit, pattern=/$must_contain/)"
+    echo "--- output ---"
+    printf '%s\n' "$out" | sed 's/^/    /'
+    echo "--------------"
+  fi
+}
+
+echo "== watch-codex-review.sh test matrix (using fake-gh.sh) =="
+echo
+
+EXTRA_ARGS=(--interval 2 --timeout 5)
+run_case "clean-timeout-nothing-new" 1 "Timed out after 5s" -- \
+  FAKE_GH_REVIEWS_SEQUENCE=1,2 FAKE_GH_COMMENTS_SEQUENCE=1,2 FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
+
+EXTRA_ARGS=(--interval 2 --timeout 6)
+run_case "detects-new-review" 0 "review by chatgpt-codex-connector" -- \
+  FAKE_GH_REVIEWS_SEQUENCE="1,2;1,2,3"
+
+EXTRA_ARGS=(--interval 2 --timeout 6)
+run_case "detects-new-issue-comment-clean-pass" 0 "comment by chatgpt-codex-connector" -- \
+  FAKE_GH_ISSUE_COMMENTS_SEQUENCE="1,2;1,2,3"
+
+# "success;error" on comments: call 1 (baseline capture) succeeds, so setup
+# completes normally; call 2 (the mandatory first poll) is where reviews
+# shows a genuinely new id AND comments fails in the same poll_once call —
+# exactly the shape of the bug this test exists to catch (a later fetch's
+# failure discarding an earlier fetch's already-found result).
+EXTRA_ARGS=(--interval 2 --timeout 6)
+run_case "partial-failure-error-after-success-still-reports" 0 "review by chatgpt-codex-connector" -- \
+  FAKE_GH_REVIEWS_SEQUENCE="1,2;1,2,3" FAKE_GH_COMMENTS_MODE_SEQUENCE="success;error"
+
+EXTRA_ARGS=(--interval 2 --timeout 8)
+run_case "partial-failure-slow-after-success-still-reports" 0 "review by chatgpt-codex-connector" -- \
+  FAKE_GH_REVIEWS_SEQUENCE="1,2;1,2,3" FAKE_GH_COMMENTS_MODE_SEQUENCE="success;slow:30"
+
+# Baseline (call 1) succeeds for all three endpoints, so setup completes;
+# every poll from the mandatory first one on, all three fail. Should be
+# recognized as a persistent problem and exited out of loudly, well before
+# --timeout would otherwise elapse -- not silently retried for the full
+# --timeout and reported as an ordinary "nothing new" timeout.
+EXTRA_ARGS=(--interval 1 --timeout 25)
+run_case "persistent-total-failure-exits-loudly" 1 "persistently failing|repeated failures|giving up" -- \
+  FAKE_GH_REVIEWS_MODE_SEQUENCE="success;error" \
+  FAKE_GH_COMMENTS_MODE_SEQUENCE="success;error" \
+  FAKE_GH_ISSUE_COMMENTS_MODE_SEQUENCE="success;error"
+
+EXTRA_ARGS=(--interval 20 --timeout 3)
+run_case "very-tight-timeout-still-attempts-and-stays-bounded" 1 "Timed out after 3s" -- \
+  FAKE_GH_REVIEWS_SEQUENCE=1,2
+
+EXTRA_ARGS=(--interval 2 --timeout 6 --bot "some-other-bot[bot]")
+run_case "bot-filter-excludes-non-matching-login" 1 "Timed out after 6s" -- \
+  FAKE_GH_REVIEWS_SEQUENCE="1,2;1,2,3"
+
+EXTRA_ARGS=(--interval 2 --timeout 6 --trigger)
+run_case "trigger-does-not-self-detect" 1 "Timed out after 6s" -- \
+  FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
+
+echo
+echo "== $PASS passed, $FAIL failed =="
+[ "$FAIL" -eq 0 ]

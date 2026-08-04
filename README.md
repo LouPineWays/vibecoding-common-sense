@@ -78,6 +78,13 @@ printing a summary. If you're watching a different bot, pass its account name wi
 `--bot <login>` (default `chatgpt-codex-connector[bot]`, Codex's own). Needs `gh`
 (authenticated) and `jq`.
 
+If you're changing this script yourself, run `scripts/test/run-tests.sh` first —
+it exercises the timing/error-handling edge cases (partial failures, a persistently
+broken API, a tight timeout, bot filtering) against a fake `gh` in a few seconds,
+instead of you finding out about them one at a time from a real bot review that takes
+minutes to respond. See `CLAUDE.md.template`, "When one spot keeps needing fixes,"
+for why that harness exists at all.
+
 The script's own header comment explains the one bug worth knowing about if you write
 anything similar yourself: `gh api --jq <expr>` takes a single query-string argument and
 does not understand jq's own `--arg` flag, so bolting `--arg` onto a `gh api --jq` call

@@ -343,6 +343,24 @@
 #     the one real attempt; every time after that, sleep out whatever's
 #     left instead of reserving again, so the loop runs out the clock and
 #     ends via the ordinary `REMAINING <= 0` check with no further requests.
+#
+# 28. #26 only skipped a fetch when the budget check *before* it failed —
+#     a fetch that started with real budget and then failed outright (a
+#     `with_timeout` kill, or a genuine HTTP error) still hit a fatal
+#     `exit 1`, discarding whatever an EARLIER fetch in the same call had
+#     already successfully brought back. Reproduced directly with the local
+#     test harness (`scripts/test/`): reviews shows a real new ID, comments
+#     fails right after — the watcher reported an error and lost the
+#     finding, instead of reporting the review it had genuinely already
+#     seen. Every fetch failure is a warning now, never fatal on its own;
+#     `attempted`/`succeeded` counts drive a separate, deliberately coarser
+#     signal instead — `TOTAL_FAILURE_STREAK`, incremented only when a
+#     round genuinely attempted at least one fetch and every single one of
+#     them failed (not when they were skipped for lack of budget, which
+#     isn't a problem, just the watch ending). After `$MAX_TOTAL_FAILURES`
+#     such rounds in a row, that's not noise anymore — auth, rate limit, or
+#     a real outage — and the script gives up loudly instead of silently
+#     retrying for the rest of `--timeout`.
 
 set -euo pipefail
 
@@ -567,33 +585,73 @@ poll_once() {
   # reservation below), not this guard's.
   #
   # Each of the three fetches below is independently skippable once the
-  # budget runs out mid-call — set to "[]" and left alone rather than
-  # aborting the whole function. See gotcha #26: the earlier version
-  # returned immediately the moment ANY fetch's remaining check failed,
-  # which threw away a review that had already been successfully fetched
-  # (sitting right there in CURRENT_REVIEWS_JSON) just because the
-  # unrelated comments fetch afterward ran out of time — reporting a
-  # timeout despite having already observed the actual response.
+  # budget runs out mid-call, AND independently allowed to just fail — set
+  # to "[]" and left alone either way, never aborting the whole function.
+  # See gotcha #26 (the budget-exhausted case) and gotcha #28 (this one):
+  # the earlier version treated a fetch that *started* with real budget but
+  # then failed outright (a timeout via with_timeout, or a genuine HTTP
+  # error) as fatal — discarding a review an EARLIER fetch in the very same
+  # call had already successfully brought back, and reporting a timeout
+  # despite having actually observed the response. A failure is now a
+  # warning, not an abort; whatever WAS fetched still gets checked below.
+  # attempted/success counts feed the persistent-failure check further
+  # down — a single flaky fetch next to two good ones is normal API noise,
+  # not a problem worth ending the watch over.
   CURRENT_REVIEWS_JSON='[]'
   CURRENT_COMMENTS_JSON='[]'
   CURRENT_ISSUE_COMMENTS_JSON='[]'
+  local attempted=0 succeeded=0
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
-      || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+    attempted=$((attempted + 1))
+    if CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")"; then
+      succeeded=$((succeeded + 1))
+    else
+      CURRENT_REVIEWS_JSON='[]'
+      echo "Warning: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2
+    fi
   fi
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
-      || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+    attempted=$((attempted + 1))
+    if CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")"; then
+      succeeded=$((succeeded + 1))
+    else
+      CURRENT_COMMENTS_JSON='[]'
+      echo "Warning: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2
+    fi
   fi
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")" \
-      || { echo "Error: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+    attempted=$((attempted + 1))
+    if CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")"; then
+      succeeded=$((succeeded + 1))
+    else
+      CURRENT_ISSUE_COMMENTS_JSON='[]'
+      echo "Warning: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2
+    fi
+  fi
+
+  # A genuine, persistent problem (bad auth, revoked token, sustained
+  # outage) looks like every fetch failing, over and over — as opposed to
+  # one flaky fetch next to successful ones (handled above by just
+  # skipping it) or the ordinary case of running low on budget near the
+  # deadline (attempted stays 0, which deliberately does NOT count here —
+  # that's not a problem, it's just the watch ending naturally). Only a
+  # real "we tried and everything failed" round moves this counter; only
+  # after several of those in a row do we give up loudly instead of
+  # silently retrying for the rest of --timeout. See gotcha #28.
+  if [ "$attempted" -gt 0 ] && [ "$succeeded" -eq 0 ]; then
+    TOTAL_FAILURE_STREAK=$((TOTAL_FAILURE_STREAK + 1))
+    if [ "$TOTAL_FAILURE_STREAK" -ge "$MAX_TOTAL_FAILURES" ]; then
+      echo "Error: all GitHub API requests have failed $TOTAL_FAILURE_STREAK times in a row — this looks like a persistent problem (auth, rate limit, network), not a transient blip. Giving up rather than silently retrying for the rest of --timeout." >&2
+      exit 1
+    fi
+  elif [ "$succeeded" -gt 0 ]; then
+    TOTAL_FAILURE_STREAK=0
   fi
 
   NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_bot_and_id "$BASELINE_REVIEW_IDS" "$BOT_LOGIN")" \
@@ -619,6 +677,12 @@ poll_once() {
   fi
   return 1
 }
+
+# How many consecutive poll_once calls have seen every fetch fail (not
+# skipped for lack of budget — genuinely attempted and failed). See
+# gotcha #28.
+TOTAL_FAILURE_STREAK=0
+MAX_TOTAL_FAILURES=3
 
 # Unconditional first poll, before any deadline math — see gotcha #6. This is
 # the only way a --timeout at or below --interval (or just a fast responder)
