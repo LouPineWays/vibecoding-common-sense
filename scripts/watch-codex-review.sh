@@ -172,6 +172,31 @@
 #     activity" the moment it's posted. Its own ID, parsed out of `gh pr
 #     comment`'s URL output, is folded into the baseline explicitly so it's
 #     excluded without reintroducing that race.
+#
+# 16. #15's fix opened its own gap: `issues/$PR/comments` is a general
+#     conversation thread, not a review-response channel — anyone can post
+#     there. Treating any new comment there as "Codex responded" means a
+#     human saying literally anything on the PR while the watcher is running
+#     produces a false success. `new_bot_comments_by_id` filters to
+#     `.user.type == "Bot"` before checking for a new ID, so only an actual
+#     bot account's comment counts. Reviews and inline review comments don't
+#     need the same filter — submitting a formal review or an inline code
+#     comment is inherently review-shaped regardless of who does it, unlike
+#     a general-purpose comment thread.
+#
+# 17. Known, accepted gap, not fixed: `START_TS` and every `remaining`/
+#     `ELAPSED` computation use `date +%s`, which truncates to whole
+#     seconds. Near a second boundary, a `--timeout` of a few seconds can
+#     look exhausted early or run up to ~1s late. A real fix needs subsecond
+#     timestamps, and the portable ways to get them are worse than the
+#     problem: GNU `date`'s `%N` (nanoseconds) isn't available on stock
+#     macOS's BSD `date` — the same class of gap `with_timeout` was already
+#     rewritten twice to avoid (gotchas #6/#8) — and bash's `$EPOCHREALTIME`
+#     needs 5.0+, unavailable on stock macOS's bash 3.2 either. This only
+#     bites at `--timeout` values low enough that nobody would realistically
+#     use them waiting on a review bot that typically takes minutes to
+#     respond, so the fix was judged not worth trading away the portability
+#     every other timing fix in this script was written to protect.
 
 set -euo pipefail
 
@@ -287,6 +312,17 @@ new_by_id() {
   jq --argjson baseline "$1" '[.[] | select(.id as $i | ($baseline | index($i)) == null)]'
 }
 
+# Same as new_by_id, but for the issue-comments endpoint specifically, where
+# any PR participant — not just review bots — can post. Restricted to
+# .user.type == "Bot" so an ordinary human conversation comment posted while
+# the watcher is running can't be mistaken for a completed review response.
+# Reviews and inline review comments don't need this: submitting a formal
+# review or an inline code comment is inherently review-shaped regardless of
+# who does it, unlike a general-purpose conversation thread.
+new_bot_comments_by_id() {
+  jq --argjson baseline "$1" '[.[] | select(.user.type == "Bot") | select(.id as $i | ($baseline | index($i)) == null)]'
+}
+
 # The whole script's "give up after --timeout seconds" promise has to start
 # here, before the baseline requests, not after them — a stalled baseline
 # request bounded to 0 (unbounded) would otherwise hang forever before the
@@ -395,7 +431,7 @@ poll_once() {
     || { echo "Error: failed to compute new reviews" >&2; exit 1; }
   NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")" \
     || { echo "Error: failed to compute new review comments" >&2; exit 1; }
-  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_by_id "$BASELINE_ISSUE_COMMENT_IDS")" \
+  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_bot_comments_by_id "$BASELINE_ISSUE_COMMENT_IDS")" \
     || { echo "Error: failed to compute new issue comments" >&2; exit 1; }
   NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')" || exit 1
   NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')" || exit 1
