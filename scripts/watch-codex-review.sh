@@ -122,9 +122,22 @@
 #     so a stalled baseline request could hang forever before the watcher
 #     ever entered its own deadline-bounded loop, well past the advertised
 #     `--timeout`. `START_TS` is now set first, and both baseline requests
-#     are bounded by `$TIMEOUT` like everything else, so the whole script's
-#     "give up after this many seconds" promise actually covers its full
-#     run, not just the polling loop after setup.
+#     are bounded, so the whole script's "give up after this many seconds"
+#     promise actually covers its full run, not just the polling loop after
+#     setup.
+#
+# 12. Two things that first fix (#11) still got wrong: it passed `$TIMEOUT`
+#     — the *original* full budget — to the second baseline request too,
+#     instead of recomputing what's actually left after the first one ran;
+#     sequential calls that each get handed the full budget can together run
+#     for close to their combined total before anything fails, the same
+#     mistake `poll_once` had already been fixed to avoid. And the
+#     `--trigger` comment POST wasn't wrapped in `with_timeout` at all, so a
+#     stalled post could still block past `--timeout` even though the clock
+#     was already running by that point. Both now recompute the remaining
+#     budget immediately before they run, bail out if it's already gone, and
+#     — for the trigger POST — go through `with_timeout` like every other
+#     network call.
 
 set -euo pipefail
 
@@ -219,12 +232,29 @@ START_TS=$(date +%s)
 BASELINE_REVIEWS_JSON="$(api_list "$TIMEOUT" "repos/$REPO/pulls/$PR/reviews")" \
   || { echo "Error: failed to fetch the baseline reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 BASELINE_REVIEW_IDS="$(echo "$BASELINE_REVIEWS_JSON" | jq '[.[].id]')"
-BASELINE_COMMENTS_JSON="$(api_list "$TIMEOUT" "repos/$REPO/pulls/$PR/comments")" \
+
+# Recompute what's left of $TIMEOUT rather than passing $TIMEOUT again — the
+# reviews call above may already have used part (or all) of it, and passing
+# the original full budget to every sequential baseline call would let setup
+# run for close to their combined total before failing, not the one
+# advertised deadline.
+BASELINE_REMAINING=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+if [ "$BASELINE_REMAINING" -le 0 ]; then
+  echo "Error: timed out fetching the baseline reviews before the comments baseline could even start" >&2
+  exit 1
+fi
+BASELINE_COMMENTS_JSON="$(api_list "$BASELINE_REMAINING" "repos/$REPO/pulls/$PR/comments")" \
   || { echo "Error: failed to fetch the baseline review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 BASELINE_COMMENT_IDS="$(echo "$BASELINE_COMMENTS_JSON" | jq '[.[].id]')"
 
 if [ "$TRIGGER" = true ]; then
-  gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null
+  TRIGGER_REMAINING=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  if [ "$TRIGGER_REMAINING" -le 0 ]; then
+    echo "Error: timed out before the @codex review trigger comment could be posted" >&2
+    exit 1
+  fi
+  with_timeout "$TRIGGER_REMAINING" gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null \
+    || { echo "Error: failed to post the @codex review trigger comment (network issue, rate limit, or timeout)" >&2; exit 1; }
   echo "Posted @codex review on $REPO#$PR"
 fi
 
