@@ -138,6 +138,14 @@
 #     budget immediately before they run, bail out if it's already gone, and
 #     — for the trigger POST — go through `with_timeout` like every other
 #     network call.
+#
+# 13. All of the above guards `remaining` at every internal call site, but
+#     none of it stops a user from passing `--timeout 0` or a negative
+#     number directly — which reaches `with_timeout`'s own "`<= 0` means
+#     unbounded" sentinel on the very first request, turning an obviously
+#     broken input into "run forever" instead of a clear, immediate error.
+#     `--timeout` (and `--interval`, same risk class) are validated as
+#     positive integers right after argument parsing, before anything runs.
 
 set -euo pipefail
 
@@ -158,16 +166,46 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# --timeout <= 0 would reach with_timeout's own "<= 0 means unbounded"
+# sentinel directly (see gotcha #9) — every internal call site recomputes a
+# guarded, always-positive "remaining" before calling it, but a user-supplied
+# --timeout 0 or a negative value bypasses that entirely and hits the
+# sentinel on the very first request, turning it unbounded instead of
+# instantly failing. Reject both here before anything runs. Same check
+# applies to --interval so a bad value fails loudly instead of spinning.
+case "$INTERVAL" in
+  ''|*[!0-9]*)
+    echo "Error: --interval must be a positive integer, got '$INTERVAL'" >&2
+    exit 2
+    ;;
+esac
+if [ "$INTERVAL" -le 0 ]; then
+  echo "Error: --interval must be a positive integer, got '$INTERVAL'" >&2
+  exit 2
+fi
+case "$TIMEOUT" in
+  ''|*[!0-9]*)
+    echo "Error: --timeout must be a positive integer, got '$TIMEOUT'" >&2
+    exit 2
+    ;;
+esac
+if [ "$TIMEOUT" -le 0 ]; then
+  echo "Error: --timeout must be a positive integer, got '$TIMEOUT'" >&2
+  exit 2
+fi
+
 # Runs "$@", printing only its stdout, but kills it and returns non-zero if
-# it's still running after $1 seconds. $1 <= 0 means "no bound" — used for
-# the one-time baseline calls below, which happen before there's any
-# deadline to measure against. stdout and stderr are captured to separate
-# files, not merged: `gh` can write a successful call's diagnostics to
-# stderr (an update-available notice, or GH_DEBUG output) without that being
-# an error, and merging the two would corrupt the JSON on our stdout with
-# that text, breaking the jq parse downstream even though the call
-# succeeded. stderr is still replayed to our own stderr either way, so nothing
-# useful is lost — it just isn't allowed to land in the JSON stream.
+# it's still running after $1 seconds. $1 <= 0 means "no bound" — no call
+# site actually passes that anymore (every internal caller recomputes a
+# guarded, positive "remaining" first, and --timeout/--interval are validated
+# above), it's kept only as a defensive fallback rather than assumed dead
+# code. stdout and stderr are captured to separate files, not merged: `gh`
+# can write a successful call's diagnostics to stderr (an update-available
+# notice, or GH_DEBUG output) without that being an error, and merging the
+# two would corrupt the JSON on our stdout with that text, breaking the jq
+# parse downstream even though the call succeeded. stderr is still replayed
+# to our own stderr either way, so nothing useful is lost — it just isn't
+# allowed to land in the JSON stream.
 with_timeout() {
   local secs="$1"; shift
   if [ "$secs" -le 0 ]; then
