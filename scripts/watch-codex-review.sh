@@ -316,6 +316,33 @@
 #     trade was judged correct: silently reporting success past a stated
 #     deadline is a worse failure mode than occasionally, honestly, timing
 #     out despite a response that arrived in the final instant.
+#
+# 26. `poll_once` used to `return 1` the moment ANY of its three fetches
+#     found `remaining <= 0` — including discarding a review that an
+#     *earlier* fetch in the same call had already successfully brought
+#     back. A new bot review sitting correctly in `CURRENT_REVIEWS_JSON`
+#     would never even be checked for new activity if the *unrelated*
+#     comments fetch right after it ran out of budget — reporting a
+#     timeout despite having already observed the real response, seconds
+#     before the actual deadline. Each fetch now defaults to `"[]"` and is
+#     skipped (not fatal) once the budget's gone, rather than aborting the
+#     whole function — whatever WAS successfully fetched still gets
+#     checked for new activity at the end, every time.
+#
+# 27. #25's closing note claimed extra tail iterations were free because
+#     `poll_once`'s guard "refuses instantly, with no network calls" —
+#     untested, and wrong. That's only true once `REMAINING` reads exactly
+#     `<= 0`; while it's still barely positive across several fast
+#     iterations in a row (a real, observed pattern, not a hypothetical),
+#     `poll_once` passes its guard and makes a genuine round of API calls
+#     every single time — confirmed with a mocked `--timeout 4`: four
+#     polling rounds, twelve total requests, for what should have been one
+#     reserved attempt. `RESERVE_USED` bounds the sleep-reservation from
+#     gotcha #25 to firing exactly once: the first time the sleep would
+#     otherwise be capped, reserve `$FINAL_POLL_RESERVE` seconds and spend
+#     the one real attempt; every time after that, sleep out whatever's
+#     left instead of reserving again, so the loop runs out the clock and
+#     ends via the ordinary `REMAINING <= 0` check with no further requests.
 
 set -euo pipefail
 
@@ -538,26 +565,36 @@ poll_once() {
   # moment before the deadline a genuine chance is the outer loop's job now
   # (leaving real, unborrowed budget for this call to spend — see the sleep
   # reservation below), not this guard's.
-  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
-  if [ "$remaining" -le 0 ]; then
-    return 1
-  fi
-  CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
-    || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+  #
+  # Each of the three fetches below is independently skippable once the
+  # budget runs out mid-call — set to "[]" and left alone rather than
+  # aborting the whole function. See gotcha #26: the earlier version
+  # returned immediately the moment ANY fetch's remaining check failed,
+  # which threw away a review that had already been successfully fetched
+  # (sitting right there in CURRENT_REVIEWS_JSON) just because the
+  # unrelated comments fetch afterward ran out of time — reporting a
+  # timeout despite having already observed the actual response.
+  CURRENT_REVIEWS_JSON='[]'
+  CURRENT_COMMENTS_JSON='[]'
+  CURRENT_ISSUE_COMMENTS_JSON='[]'
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
-  if [ "$remaining" -le 0 ]; then
-    return 1
+  if [ "$remaining" -gt 0 ]; then
+    CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
+      || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
   fi
-  CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
-    || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
-  if [ "$remaining" -le 0 ]; then
-    return 1
+  if [ "$remaining" -gt 0 ]; then
+    CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
+      || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
   fi
-  CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")" \
-    || { echo "Error: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  if [ "$remaining" -gt 0 ]; then
+    CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")" \
+      || { echo "Error: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+  fi
 
   NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_bot_and_id "$BASELINE_REVIEW_IDS" "$BOT_LOGIN")" \
     || { echo "Error: failed to compute new reviews" >&2; exit 1; }
@@ -588,6 +625,14 @@ poll_once() {
 # ever gets observed at all.
 poll_once && exit 0
 
+# Whether the sleep reservation below has already been used once. See
+# gotcha #27: without this, "reserve $FINAL_POLL_RESERVE seconds" fires
+# again on every later iteration too, for as long as REMAINING stays
+# barely positive — and each of those firings makes a real, if small,
+# round of network calls, not a free no-op the way this comment used to
+# (wrongly) claim.
+RESERVE_USED=false
+
 while :; do
   NOW_TS=$(date +%s)
   REMAINING=$((TIMEOUT - (NOW_TS - START_TS)))
@@ -596,27 +641,28 @@ while :; do
   fi
   SLEEP_FOR=$INTERVAL
   if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
-    # Leave $FINAL_POLL_RESERVE seconds of the ORIGINAL remaining budget
-    # unslept, rather than sleeping all the way to the deadline — so the
-    # poll below starts with genuine, unborrowed time still on the clock.
-    # See gotcha #25: this reserve lives entirely within TIMEOUT, unlike
-    # the grace-based attempt it replaces, which extended past it instead.
-    SLEEP_FOR=$((REMAINING - FINAL_POLL_RESERVE))
-    if [ "$SLEEP_FOR" -lt 0 ]; then
-      SLEEP_FOR=0
+    if [ "$RESERVE_USED" = true ]; then
+      # Already spent the one reserved attempt (below) on an earlier
+      # iteration. Sleep out whatever's left instead of reserving again —
+      # this iteration's sleep ends the loop via the ordinary REMAINING <=
+      # 0 check above on the next pass, with no further network calls.
+      SLEEP_FOR=$REMAINING
+    else
+      # Leave $FINAL_POLL_RESERVE seconds of the ORIGINAL remaining budget
+      # unslept, rather than sleeping all the way to the deadline — so the
+      # poll below starts with genuine, unborrowed time still on the
+      # clock. See gotcha #25: this reserve lives entirely within
+      # TIMEOUT, unlike the grace-based attempt it replaces, which
+      # extended past it instead.
+      SLEEP_FOR=$((REMAINING - FINAL_POLL_RESERVE))
+      if [ "$SLEEP_FOR" -lt 0 ]; then
+        SLEEP_FOR=0
+      fi
+      RESERVE_USED=true
     fi
   fi
   sleep "$SLEEP_FOR"
 
-  # Deliberately no "was this the final iteration, so stop now" bookkeeping
-  # (gotcha #22 had that, and it discarded real leftover budget). The
-  # ordinary REMAINING <= 0 check at the top of the next iteration is what
-  # ends this loop. Any extra iterations in the last stretch, once
-  # REMAINING has shrunk below $FINAL_POLL_RESERVE, are cheap: poll_once's
-  # own unconditional "remaining <= 0 → return 1" guard refuses instantly,
-  # with no network calls, so there's no repeated round of real requests
-  # left to waste — just a few near-zero-cost iterations before the top
-  # check finally sees REMAINING at or below zero and breaks for good.
   poll_once && exit 0
 done
 
