@@ -1,0 +1,171 @@
+# Project rules for AI coding agents
+
+This file is read automatically by Claude Code (`CLAUDE.md`) at the start of every session
+in this repo. If you also use Codex, copy or symlink this same content to `AGENTS.md` —
+Codex reads that file the way Claude Code reads this one. Keep the two in sync; a rule that
+exists in only one place will silently not apply when the other agent is driving.
+
+Everything below is a starting point pulled from a real production repo, then stripped of
+anything project-specific. Delete what doesn't apply, keep what does, and add your own
+house rules under a new heading as you discover them — the value of this file grows every
+time an agent does something surprising and you write down the rule that would have
+prevented it.
+
+---
+
+## Git & PR workflow
+
+**First, confirm your repo's actual default branch.** Plenty of repos still use `master`,
+`trunk`, or something else instead of `main` — run `git remote show origin | grep 'HEAD
+branch'` (or check your Git host's settings) and use the real name everywhere below.
+`main` in these examples is a placeholder, not an assumption about your repo.
+
+**Check for uncommitted local changes before creating a branch, not just before destroying
+one.** `git status`. `git checkout -b` carries any uncommitted changes in the working tree
+onto the new branch — if those belong to something else (a parallel session's in-progress
+edit, work you forgot was open), they ride along into your new branch and its eventual
+commit. Commit, stash, or explicitly account for anything `git status` shows before you
+branch, not only before a destructive command.
+
+**Always branch from the remote default branch, never from whatever is currently checked
+out.**
+
+```
+git fetch origin main && git checkout -b <your-branch> origin/main
+```
+
+(swap `main` for your repo's real default branch, confirmed above)
+
+`git checkout -b <name>` with no start point branches from the current `HEAD`. If you (or a
+parallel agent session, or a past version of yourself from an hour ago) left another
+branch checked out, your new branch silently inherits all of its unmerged commits as
+ancestors. If the repo squash-merges, that other work rides along inside your PR:
+unreviewed, never tested on its own, and credited to a commit message describing something
+else entirely.
+
+Before pushing, verify with `git log --oneline origin/main..HEAD` (same substitution) — it
+should list only your own commits. If it lists more, you branched from the wrong place;
+stop and fix the base before pushing.
+
+**Never commit directly to the default branch.** This matters even more if more than one
+agent or person might touch this working directory — confirm the current branch
+(`git branch --show-current`) before committing rather than assuming.
+
+**"Merge when ready" means merge after CI reports green, not immediately on PR creation.**
+Before merging, check that every required status check has actually passed — don't guess
+from the PR being open a while, and don't assume a failure is something transient like
+quota without reading the actual failure log.
+
+**If you're running multiple agents in parallel against the same repo** (e.g. Claude Code
+and Codex both making changes at the same time), give each one its own worktree or clone —
+not just its own branch. A single working directory can only have one branch checked out
+at a time; two concurrent processes sharing that directory will still read and write the
+same files no matter which branch each one thinks it's on, and can overwrite or interleave
+each other's edits. `git worktree add ../agent-2 -b <branch> origin/main` gets you an
+isolated working directory on its own branch without a second full clone. When
+consolidating their work back together, cherry-pick specific commits onto a fresh branch
+from the remote default rather than `git merge`-ing one agent's branch into another's —
+merging drags in that branch's full history and can trip pre-push hooks that expect a
+linear, reviewed set of commits.
+
+If you discover a branch, stash, or set of uncommitted changes you don't recognize,
+investigate before deleting or overwriting it — it may be another session's in-progress
+work. Prefer a reversible move (stash, rename, set aside) over a destructive one.
+
+## Status: check, don't read
+
+Status prose (README badges, a "done" section in a doc, a comment claiming something is
+implemented) drifts out of sync with reality constantly, because nobody remembers to update
+it every time the code changes. Treat it as a hint, never as a source of truth. For
+anything shippable, `git log` and the actual code are authoritative — a doc that disagrees
+with them is the thing that's wrong, not the code.
+
+If your project tracks a backlog or status file, prefer one where claims are falsifiable:
+a "done" entry that cites a specific commit or PR, ideally checked by a script in CI,
+beats a checkbox someone ticked by hand and never revisited.
+
+## Safety and file operations
+
+Never delete or overwrite a file, folder, or branch without first confirming the exact
+target path or ref with the user — "clean this up" is not the same as "delete
+`/exact/path`". If your project has data that must never be touched by an agent (a media
+folder, a user database dump, anything genuinely irreplaceable), say so explicitly here,
+by name, with no exceptions — don't rely on the agent inferring it's off-limits.
+
+Before any command that could discard uncommitted work (`git checkout --`, `git restore`,
+`git reset --hard`, `git clean`, `rm -rf` inside the repo), run `git status` first and stash
+or commit anything that's there.
+
+## House style, by example
+
+Codify small, repeatable conventions here so an agent doesn't have to be told twice. One
+real example, so you can see the pattern: a team that decided user-facing copy should never
+contain an em dash wrote it as a standing rule (`Em dashes are radioactive in user-facing
+copy — never use one in a string a reader sees. This does not apply to code comments,
+which may still use them freely.`) instead of correcting it in every PR review. Whatever
+your own repeated corrections are — naming conventions, a banned pattern, a required check
+before a certain kind of change — write them here the same way, as a rule with a reason,
+not just a reminder.
+
+## When one spot keeps needing fixes, stop and diagnose before patch three
+
+If you've edited the same function or file more than twice for what looks like a new bug
+each time, stop before writing the next patch and ask: is this actually several unrelated
+bugs, or one fragile design producing a new symptom every round? A patch verified only
+against the one scenario that was just reported doesn't test the *shape* of the problem —
+it silently leaves the design just as capable of producing the next symptom, so the fix
+count climbs while the underlying bug count doesn't actually drop. Each individual patch
+can be completely correct and the loop still never converges, because "correct for the
+reported case" and "correct in general" are different claims.
+
+This exact loop happened building the review-watcher script in this pack
+(`scripts/watch-codex-review.sh`): getting "poll for a bot's response within a timeout,
+without polling forever or missing the answer" right took roughly twenty rounds of
+automated review before anyone stopped to name what was actually happening. Most of those
+rounds were narrow, verified, genuinely-correct fixes to the *one case just reported* —
+and nearly all of them were the same underlying defect wearing a new trigger: a function
+that discarded already-successful partial work the moment any one step inside it failed,
+whether that step failed from a budget check, a timeout, or a real error. Patch after patch
+closed the specific trigger without ever asking "what's the general version of this
+failure?" The loop only ended once someone stepped back and asked that question directly,
+then made failure non-fatal to already-completed work as a structural rule, instead of
+special-casing the next way a step could fail.
+
+Two things to actually do differently once you notice you're in this loop:
+
+- **Name the general shape before writing the next patch.** If patch two and patch three
+  are both edits to the same dozen lines for "another edge case," write down — in a
+  sentence, doesn't need to be formal — what class of failure they're both instances of.
+  Often the honest answer is "this can't be made narrowly correct, it needs restructuring,"
+  and that's worth knowing before patch four.
+- **If verifying each patch costs real external time** (a slow bot review, a live API call,
+  a human in the loop) and you've paid that cost more than twice on the same problem, stop
+  paying it per-iteration. Build a fast local repro — a mock, a stub, a fake input that
+  triggers the same code path — so the next several attempts cost seconds instead of
+  minutes each. Still paying the external round-trip tax for iteration five is itself a
+  sign you're testing symptoms, not the actual fix.
+
+## Multi-agent collaboration
+
+If you use more than one AI coding tool against this repo (Claude Code, Codex, others),
+decide and write down who's better suited to what, rather than re-deciding it every time:
+
+- One agent as the primary driver for anything needing full project context or multi-file
+  changes.
+- A second agent (if it has capabilities the first doesn't — e.g. image generation, or a
+  genuinely independent perspective for review) for self-contained tasks and adversarial
+  second-opinion review.
+
+**A second, independent reviewer on every PR that touches real application code is worth
+defaulting to, not reserving for changes that look risky at a glance.** A routine-looking
+PR is exactly the kind that slips through unreviewed — plenty of real projects have shipped
+a PR with zero review that turned out to carry several correctness bugs, caught only in a
+retrospective sweep well after release. Skip the extra review only for changes that can't
+ship a user-facing bug (docs, tooling config, content edits).
+
+When kicking off a task on a second agent, give it purpose and hard constraints, let it
+propose its own plan, review the plan before it touches code, then review the diff after —
+and still verify its claims independently before merging, the same as you would for a
+change you wrote yourself. `scripts/watch-codex-review.sh <owner/repo> <pr-number>
+--trigger` (in this pack) requests that review and polls for the response instead of you
+checking back on the PR by hand.
