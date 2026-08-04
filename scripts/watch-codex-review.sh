@@ -411,6 +411,27 @@
 #     `--trigger-comment TEXT` (default `"@codex review"`, so existing
 #     invocations are unaffected) makes the posted body configurable too —
 #     set it alongside `--bot` when watching something other than Codex.
+#
+# 32. Known, accepted gap, not fixed: `with_timeout`'s `kill -TERM "$pid"` on
+#     expiry only signals the direct backgrounded command, not any of its
+#     own children. In the test harness this orphans `fake-gh.sh`'s `sleep N`
+#     (used by the `slow:N` mode) when the wrapping command times out first;
+#     in real use it would matter only if `gh` itself ever spawned a
+#     detached child, which it doesn't currently. Killing the whole process
+#     group instead needs job control (`set -m`) scoped tightly enough not
+#     to change this script's own output (job-control status lines like
+#     "[1]+ Terminated" would land on stderr and could break callers, and
+#     several existing tests match exact output text) — and this script's
+#     one available test environment is Git-for-Windows Bash, which has
+#     neither `pkill` nor verified negative-PID process-group kill
+#     semantics, so a fix written and only validated here could easily be
+#     wrong on the macOS/Linux environments this script actually documents
+#     supporting elsewhere (see gotcha #8's `timeout`-availability discussion
+#     and gotcha #17). Left undone rather than shipped unverified; the two
+#     ingredients a real fix needs are `set -m` scoped to a subshell around
+#     just the backgrounded call, and a way to confirm on a real macOS or
+#     Linux box that group-kill actually reaps the children without
+#     otherwise changing this script's stdout/stderr contract.
 
 set -euo pipefail
 
@@ -499,6 +520,8 @@ with_timeout() {
   local ticks=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$ticks" -ge "$deadline_ticks" ]; then
+      # Only signals $pid itself, not any children it may have spawned. See
+      # gotcha #32 for why that's left as a known gap rather than guessed at.
       kill -TERM "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
       cat "$err" >&2
@@ -604,7 +627,16 @@ if [ "$TRIGGER" = true ]; then
   # comment itself is not yet in that baseline and would otherwise be
   # mistaken for Codex's response the moment it appears. Add its own ID to
   # the baseline explicitly so it's excluded without reintroducing the race.
-  TRIGGER_COMMENT_ID="$(printf '%s' "$TRIGGER_OUTPUT" | grep -oE '[0-9]+$' | tail -1)"
+  #
+  # `|| true` is load-bearing, not decoration: `gh pr comment` is documented
+  # only to post the comment, not to guarantee a trailing numeric ID on
+  # stdout, so a `gh` version or output format that omits one makes `grep`
+  # find nothing and exit 1. Under `set -o pipefail` that failure propagates
+  # out of the whole `cmd | grep | tail` pipeline, and under `set -e` an
+  # unprotected nonzero assignment here would abort the script before ever
+  # reaching the `-n` check below that already treats a missing ID as fine.
+  # The extraction is optional by design; only its own failure should be, too.
+  TRIGGER_COMMENT_ID="$(printf '%s' "$TRIGGER_OUTPUT" | grep -oE '[0-9]+$' | tail -1)" || true
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
     BASELINE_ISSUE_COMMENT_IDS="$(echo "$BASELINE_ISSUE_COMMENT_IDS" | jq --argjson id "$TRIGGER_COMMENT_ID" '. + [$id]')"
   fi
@@ -686,7 +718,7 @@ poll_once() {
       REVIEWS_FAILURE_STREAK=$((REVIEWS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch reviews from the GitHub API ($REVIEWS_FAILURE_STREAK in a row)" >&2
       if [ "$REVIEWS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        PERSISTENT_FAILURE_MESSAGE="fetching reviews has failed $REVIEWS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real review response could be sitting there unobserved"
+        PERSISTENT_FAILURE_MESSAGE="fetching reviews has failed $REVIEWS_FAILURE_STREAK times in a row: this endpoint looks persistently broken (auth, rate limit, network), and a real review response could be sitting there unobserved"
       fi
     fi
   fi
@@ -700,7 +732,7 @@ poll_once() {
       COMMENTS_FAILURE_STREAK=$((COMMENTS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch review comments from the GitHub API ($COMMENTS_FAILURE_STREAK in a row)" >&2
       if [ "$COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        PERSISTENT_FAILURE_MESSAGE="fetching review comments has failed $COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real inline comment could be sitting there unobserved"
+        PERSISTENT_FAILURE_MESSAGE="fetching review comments has failed $COMMENTS_FAILURE_STREAK times in a row: this endpoint looks persistently broken (auth, rate limit, network), and a real inline comment could be sitting there unobserved"
       fi
     fi
   fi
@@ -714,7 +746,7 @@ poll_once() {
       ISSUE_COMMENTS_FAILURE_STREAK=$((ISSUE_COMMENTS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch issue comments from the GitHub API ($ISSUE_COMMENTS_FAILURE_STREAK in a row)" >&2
       if [ "$ISSUE_COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        PERSISTENT_FAILURE_MESSAGE="fetching issue comments has failed $ISSUE_COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real clean-pass response could be sitting there unobserved"
+        PERSISTENT_FAILURE_MESSAGE="fetching issue comments has failed $ISSUE_COMMENTS_FAILURE_STREAK times in a row: this endpoint looks persistently broken (auth, rate limit, network), and a real clean-pass response could be sitting there unobserved"
       fi
     fi
   fi
@@ -736,7 +768,7 @@ poll_once() {
     echo
     echo "New activity on $REPO#$PR:"
     echo "$NEW_REVIEWS_JSON" | jq -r '.[] | "- review by \(.user.login): \(.state)"'
-    echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
+    echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?"): " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     echo "$NEW_ISSUE_COMMENTS_JSON" | jq -r '.[] | "- comment by \(.user.login): " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     return 0
   fi

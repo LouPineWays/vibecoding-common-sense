@@ -23,7 +23,12 @@ FAIL=0
 # run_case <name> <expected_exit> <must_contain_regex> -- <env assignments...>
 # The env assignments are exported, the watcher is run with a fresh
 # FAKE_GH_STATE_DIR, and the case passes if the exit code matches AND (if a
-# pattern was given) the combined stdout+stderr contains it.
+# pattern was given) the combined stdout+stderr contains it. Set MAX_DURATION
+# (seconds) right before a call to also require actual wall-clock runtime to
+# stay under it -- unset (the default) skips that check. Exit code and output
+# text alone don't prove a bound was honored: a regression that overslept the
+# whole --interval and then still printed the same "Timed out after Ns"
+# message would pass a text-only check while missing the point of the case.
 run_case() {
   local name="$1" expected_exit="$2" must_contain="$3"
   shift 3
@@ -33,10 +38,13 @@ run_case() {
   rm -rf "$state_dir"
   mkdir -p "$state_dir"
 
-  local out
+  local out start_ts end_ts elapsed
+  start_ts=$(date +%s)
   out="$(env PATH="$PATH" FAKE_GH_STATE_DIR="$state_dir" "$@" \
     bash "$WATCHER" fake/repo 1 "${EXTRA_ARGS[@]}" 2>&1)"
   local actual_exit=$?
+  end_ts=$(date +%s)
+  elapsed=$((end_ts - start_ts))
 
   local ok=true
   if [ "$actual_exit" -ne "$expected_exit" ]; then
@@ -45,17 +53,21 @@ run_case() {
   if [ -n "$must_contain" ] && ! printf '%s' "$out" | grep -qiE "$must_contain"; then
     ok=false
   fi
+  if [ -n "${MAX_DURATION:-}" ] && [ "$elapsed" -gt "$MAX_DURATION" ]; then
+    ok=false
+  fi
 
   if [ "$ok" = true ]; then
     PASS=$((PASS + 1))
-    echo "PASS: $name"
+    echo "PASS: $name (${elapsed}s)"
   else
     FAIL=$((FAIL + 1))
-    echo "FAIL: $name (exit=$actual_exit, expected=$expected_exit, pattern=/$must_contain/)"
+    echo "FAIL: $name (exit=$actual_exit, expected=$expected_exit, pattern=/$must_contain/, elapsed=${elapsed}s, max=${MAX_DURATION:-none})"
     echo "--- output ---"
     printf '%s\n' "$out" | sed 's/^/    /'
     echo "--------------"
   fi
+  unset MAX_DURATION
 }
 
 echo "== watch-codex-review.sh test matrix (using fake-gh.sh) =="
@@ -128,7 +140,21 @@ EXTRA_ARGS=(--interval 2 --timeout 6 --trigger --trigger-comment "@other-bot ple
 run_case "custom-trigger-comment-is-actually-posted" 1 "posted trigger body: @other-bot please review" -- \
   FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
 
+# `gh pr comment` isn't documented to guarantee a trailing numeric ID on
+# stdout -- the watcher's ID extraction has to be optional in practice, not
+# just in the comment describing it. Reaching the ordinary timeout message
+# (rather than crashing on the unmatched grep under set -euo pipefail)
+# proves the whole script survived past the trigger post.
+EXTRA_ARGS=(--interval 2 --timeout 6 --trigger)
+run_case "trigger-output-without-trailing-id-does-not-crash" 1 "Timed out after 6s" -- \
+  FAKE_GH_TRIGGER_OUTPUT="ok, comment posted" FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
+
+# MAX_DURATION 10 (well under the 20s --interval, comfortably over the ~3-4s
+# actually expected) is what makes this case prove its own name: without it,
+# a regression that slept the full --interval before ever rechecking the
+# deadline would still print "Timed out after 3s" and pass on text alone.
 EXTRA_ARGS=(--interval 20 --timeout 3)
+MAX_DURATION=10
 run_case "very-tight-timeout-still-attempts-and-stays-bounded" 1 "Timed out after 3s" -- \
   FAKE_GH_REVIEWS_SEQUENCE=1,2
 

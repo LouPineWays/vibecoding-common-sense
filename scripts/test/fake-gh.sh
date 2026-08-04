@@ -149,7 +149,16 @@ elif [ "${args[0]:-}" = "pr" ] && [ "${args[1]:-}" = "comment" ]; then
     fi
   done
   echo "fake-gh: posted trigger body: $body" >&2
-  echo "https://github.com/fake/repo/pull/1#issuecomment-999999"
+  # Real `gh pr comment` isn't documented to guarantee a trailing numeric ID
+  # on stdout. FAKE_GH_TRIGGER_OUTPUT lets a test exercise that: unset, this
+  # defaults to the normal ID-bearing URL; set to text with no trailing
+  # digits (e.g. "ok", or empty), it reproduces the shape of output the
+  # watcher's optional ID extraction must survive without crashing.
+  if [ -n "${FAKE_GH_TRIGGER_OUTPUT+set}" ]; then
+    printf '%s\n' "$FAKE_GH_TRIGGER_OUTPUT"
+  else
+    echo "https://github.com/fake/repo/pull/1#issuecomment-999999"
+  fi
 else
   echo "fake-gh: unhandled invocation: ${args[*]}" >&2
   exit 1
