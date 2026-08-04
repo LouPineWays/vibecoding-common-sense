@@ -100,6 +100,15 @@
 #    all — the opposite of what an exhausted deadline should mean. Every
 #    `remaining` computed inside `poll_once` is clamped to at least 1 before
 #    it's passed on, so it's always a real bound during actual polling.
+#
+# 10. `with_timeout` originally merged the wrapped command's stdout and
+#     stderr into one captured stream (`2>&1`). `gh` can write to stderr on
+#     an otherwise-successful call — an update-available notice, or
+#     `GH_DEBUG` output — and merging the two lets that text land ahead of
+#     the JSON that gets piped into `jq`, breaking the parse even though the
+#     API request itself worked. stdout and stderr are captured to separate
+#     files instead; stderr is still replayed to our own stderr afterward,
+#     so nothing is silently dropped, it just can't corrupt the JSON stream.
 
 set -euo pipefail
 
@@ -120,27 +129,35 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Runs "$@", capturing its stdout, but kills it and returns non-zero if it's
-# still running after $1 seconds. $1 <= 0 means "no bound" — used for the
-# one-time baseline calls below, which happen before there's any deadline to
-# measure against.
+# Runs "$@", printing only its stdout, but kills it and returns non-zero if
+# it's still running after $1 seconds. $1 <= 0 means "no bound" — used for
+# the one-time baseline calls below, which happen before there's any
+# deadline to measure against. stdout and stderr are captured to separate
+# files, not merged: `gh` can write a successful call's diagnostics to
+# stderr (an update-available notice, or GH_DEBUG output) without that being
+# an error, and merging the two would corrupt the JSON on our stdout with
+# that text, breaking the jq parse downstream even though the call
+# succeeded. stderr is still replayed to our own stderr either way, so nothing
+# useful is lost — it just isn't allowed to land in the JSON stream.
 with_timeout() {
   local secs="$1"; shift
   if [ "$secs" -le 0 ]; then
     "$@"
     return $?
   fi
-  local out
+  local out err
   out="$(mktemp)"
-  "$@" >"$out" 2>&1 &
+  err="$(mktemp)"
+  "$@" >"$out" 2>"$err" &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$secs" ]; then
       kill -TERM "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
+      cat "$err" >&2
       cat "$out"
-      rm -f "$out"
+      rm -f "$out" "$err"
       return 124
     fi
     sleep 1
@@ -148,8 +165,9 @@ with_timeout() {
   done
   wait "$pid" 2>/dev/null
   local status=$?
+  cat "$err" >&2
   cat "$out"
-  rm -f "$out"
+  rm -f "$out" "$err"
   return "$status"
 }
 
