@@ -10,8 +10,9 @@
 #   --interval N     seconds between checks (default 20)
 #   --timeout N      give up after this many seconds (default 900 = 15 min)
 #
-# Exits 0 and prints a summary the moment a new review or new review comments
-# appear after the watch started. Exits 1 on timeout.
+# Exits 0 and prints a summary the moment a genuinely new review or review
+# comment (by ID, not just a changed count) appears after the watch started.
+# Exits 1 on timeout.
 #
 # Requires: gh (authenticated), jq
 #
@@ -32,18 +33,27 @@
 #    page and wraps them as an array of per-page arrays, so `jq 'add'`
 #    flattens them back into one real list — see api_list() below.
 #
-# 3. Detecting "new reviews" by comparing `submitted_at` to a captured
-#    timestamp has a second-resolution race: a review submitted in the same
-#    UTC second the baseline was captured compares equal, not greater, and
-#    a strict `>` would silently miss it. Comparing review IDs against a
-#    baseline ID set (the same way the comment count already worked) has no
-#    such boundary, so that's what this script does instead of timestamps.
+# 3. Detecting activity by comparing item *counts* to a baseline is fooled
+#    two different ways: a deletion can land at the same moment as a new
+#    item and cancel it out in the count, or a deletion alone can make the
+#    count look "changed" with nothing new to actually report. Comparing IDs
+#    against a baseline ID set — new activity is anything whose ID wasn't in
+#    the baseline — has neither failure mode, so that's what both reviews
+#    and comments use below, never a raw count.
 #
-# 4. `sleep "$INTERVAL"` every iteration means the script can run well past
-#    `--timeout` — once for a timeout shorter than one interval, and every
-#    time for the seconds spent actually making the paginated API requests,
-#    which are never subtracted from the budget. This script tracks wall-clock
-#    elapsed time from a fixed start and caps each sleep at whatever's left.
+# 4. Comparing `submitted_at` to a captured timestamp has a second-resolution
+#    race on top of the count problem above: a review submitted in the same
+#    UTC second the baseline was captured compares equal, not greater, and a
+#    strict `>` would silently miss it. ID comparison sidesteps this too.
+#
+# 5. `sleep "$INTERVAL"` every iteration, uncorrected, lets the script run
+#    well past `--timeout`: once because a timeout shorter than one interval
+#    still sleeps the full interval, and every time because the seconds
+#    spent actually making the paginated API requests are never subtracted
+#    from the budget. This script tracks wall-clock elapsed time from a
+#    fixed start, caps each sleep at whatever's left, and rechecks the
+#    deadline again right after waking up — before spending any more time on
+#    API calls — so a request only ever starts while time still remains.
 
 set -euo pipefail
 
@@ -69,6 +79,12 @@ api_list() {
   gh api --paginate --slurp "$1" | jq 'add'
 }
 
+# Reads a JSON array on stdin, returns the elements whose .id isn't present
+# in the JSON array passed as $1.
+new_by_id() {
+  jq --argjson baseline "$1" '[.[] | select(.id as $i | ($baseline | index($i)) == null)]'
+}
+
 # Snapshot the current state BEFORE posting the trigger comment, not after.
 # A review bot can respond fast enough that if the trigger goes out first,
 # its review and comments land inside what would become the "baseline" —
@@ -76,21 +92,22 @@ api_list() {
 # time out despite a real response.
 BASELINE_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
 BASELINE_REVIEW_IDS="$(echo "$BASELINE_REVIEWS_JSON" | jq '[.[].id]')"
-BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEWS_JSON" | jq 'length')"
-BASELINE_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
+BASELINE_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
+BASELINE_COMMENT_IDS="$(echo "$BASELINE_COMMENTS_JSON" | jq '[.[].id]')"
 
 if [ "$TRIGGER" = true ]; then
   gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null
   echo "Posted @codex review on $REPO#$PR"
 fi
 
-echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENTS, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
+BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEW_IDS" | jq 'length')"
+BASELINE_COMMENT_COUNT="$(echo "$BASELINE_COMMENT_IDS" | jq 'length')"
+echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENT_COUNT, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
 START_TS=$(date +%s)
 while :; do
   NOW_TS=$(date +%s)
-  ELAPSED=$((NOW_TS - START_TS))
-  REMAINING=$((TIMEOUT - ELAPSED))
+  REMAINING=$((TIMEOUT - (NOW_TS - START_TS)))
   if [ "$REMAINING" -le 0 ]; then
     break
   fi
@@ -100,23 +117,26 @@ while :; do
   fi
   sleep "$SLEEP_FOR"
 
-  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
-  CURRENT_REVIEW_COUNT="$(echo "$CURRENT_REVIEWS_JSON" | jq 'length')"
-  CURRENT_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
-
   NOW_TS=$(date +%s)
   ELAPSED=$((NOW_TS - START_TS))
-  echo "  [${ELAPSED}s] reviews: $CURRENT_REVIEW_COUNT (was $BASELINE_REVIEW_COUNT), review comments: $CURRENT_COMMENTS (was $BASELINE_COMMENTS)"
+  if [ "$((TIMEOUT - ELAPSED))" -le 0 ]; then
+    break
+  fi
 
-  if [ "$CURRENT_REVIEW_COUNT" -ne "$BASELINE_REVIEW_COUNT" ] || [ "$CURRENT_COMMENTS" -ne "$BASELINE_COMMENTS" ]; then
+  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
+  CURRENT_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
+  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")"
+  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")"
+  NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')"
+  NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')"
+
+  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT"
+
+  if [ "$NEW_REVIEW_COUNT" -gt 0 ] || [ "$NEW_COMMENT_COUNT" -gt 0 ]; then
     echo
     echo "New activity on $REPO#$PR:"
-    echo "$CURRENT_REVIEWS_JSON" \
-      | jq --argjson baseline "$BASELINE_REVIEW_IDS" -r \
-        '.[] | select(.id as $i | ($baseline | index($i)) == null) | "- review by \(.user.login): \(.state)"'
-    api_list "repos/$REPO/pulls/$PR/comments" \
-      | jq -r --argjson skip "$BASELINE_COMMENTS" \
-        '.[$skip:] | .[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
+    echo "$NEW_REVIEWS_JSON" | jq -r '.[] | "- review by \(.user.login): \(.state)"'
+    echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     exit 0
   fi
 done
