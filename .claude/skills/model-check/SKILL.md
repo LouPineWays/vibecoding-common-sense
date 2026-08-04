@@ -121,8 +121,16 @@ is 2 (finding it takes real judgment), and that's exactly the "judgment about wh
 correct" case the local-model description above already calls a poor fit — a local
 model can't verify itself against anything, pasted snippet included. Only recommend
 **local model (free)** and say so explicitly when the tool-use gate passes AND
-reasoning depth is also 0-1. Otherwise — tools/context needed, or reasoning depth 2 —
-stay on the smallest hosted model.
+reasoning depth is also 0-1.
+
+If the tool-use gate fails (tools or project context are actually needed), stay on the
+smallest hosted model — that's just the table's normal sum 0-1 result. But if reasoning
+depth is 2, don't fall back to the smallest hosted model either: that tier has no effort
+dial (Stage 2 below is skipped for it), so a task that genuinely needs deep reasoning
+would land there with no way to get either more model capability or more deliberation —
+neither Stage 1's sum nor Stage 2's effort ever actually sees the reasoning-depth signal.
+Promote to at least the mid-tier model instead, so Stage 2 has an effort dial to spend
+that signal on.
 
 ## Stage 2: pick the effort (skip for tiers with no effort dial)
 
