@@ -97,6 +97,18 @@ run_case "persistent-total-failure-exits-loudly" 1 "persistently failing|repeate
   FAKE_GH_COMMENTS_MODE_SEQUENCE="success;error" \
   FAKE_GH_ISSUE_COMMENTS_MODE_SEQUENCE="success;error"
 
+# Reviews specifically stays broken every round; comments and issue
+# comments stay healthy the whole time. An aggregate all-three-failed
+# counter would never trip here, since two endpoints keep succeeding every
+# round and would keep resetting it -- this is exactly the blind spot
+# gotcha #29 exists to close. Should still exit loudly, naming reviews
+# specifically, well before --timeout elapses.
+EXTRA_ARGS=(--interval 1 --timeout 25)
+run_case "single-endpoint-persistent-failure-exits-loudly" 1 "reviews.*failed.*times in a row" -- \
+  FAKE_GH_REVIEWS_MODE_SEQUENCE="success;error" \
+  FAKE_GH_COMMENTS_SEQUENCE=1,2 \
+  FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
+
 EXTRA_ARGS=(--interval 20 --timeout 3)
 run_case "very-tight-timeout-still-attempts-and-stays-bounded" 1 "Timed out after 3s" -- \
   FAKE_GH_REVIEWS_SEQUENCE=1,2

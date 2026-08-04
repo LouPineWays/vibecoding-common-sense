@@ -352,15 +352,26 @@
 #     test harness (`scripts/test/`): reviews shows a real new ID, comments
 #     fails right after — the watcher reported an error and lost the
 #     finding, instead of reporting the review it had genuinely already
-#     seen. Every fetch failure is a warning now, never fatal on its own;
-#     `attempted`/`succeeded` counts drive a separate, deliberately coarser
-#     signal instead — `TOTAL_FAILURE_STREAK`, incremented only when a
-#     round genuinely attempted at least one fetch and every single one of
-#     them failed (not when they were skipped for lack of budget, which
-#     isn't a problem, just the watch ending). After `$MAX_TOTAL_FAILURES`
-#     such rounds in a row, that's not noise anymore — auth, rate limit, or
-#     a real outage — and the script gives up loudly instead of silently
-#     retrying for the rest of `--timeout`.
+#     seen. Every fetch failure is a warning now, never fatal on its own —
+#     a separate, deliberately coarser signal (see #29) is what decides
+#     whether a failure pattern is actually worth giving up over.
+#
+# 29. The first version of that "deliberately coarser signal" pooled all
+#     three endpoints into one counter, reset the instant ANY of them
+#     succeeded. That's blind to exactly the case that matters most: one
+#     endpoint persistently broken (bad scope on a token, a resource-
+#     specific rate limit) while the other two stay healthy never trips an
+#     aggregate counter, because two successes reset it every round — but
+#     that one broken endpoint could be the exact one that would have shown
+#     the real response, and the watcher would run out the full `--timeout`
+#     reporting an ordinary, unremarkably-worded "no new activity," not
+#     "reviews specifically couldn't be checked the whole time." Each
+#     endpoint now has its own independent streak
+#     (`REVIEWS_FAILURE_STREAK` / `COMMENTS_FAILURE_STREAK` /
+#     `ISSUE_COMMENTS_FAILURE_STREAK`) and can trip the loud exit on its
+#     own — after `$MAX_ENDPOINT_FAILURES` consecutive failures on that one
+#     endpoint, regardless of how the other two are doing, naming which
+#     endpoint is degraded so the message is actually actionable.
 
 set -euo pipefail
 
@@ -600,58 +611,60 @@ poll_once() {
   CURRENT_REVIEWS_JSON='[]'
   CURRENT_COMMENTS_JSON='[]'
   CURRENT_ISSUE_COMMENTS_JSON='[]'
-  local attempted=0 succeeded=0
 
+  # Failures are tracked PER ENDPOINT, not pooled into one aggregate count
+  # — see gotcha #29. A single endpoint that's persistently broken (say,
+  # reviews returning 403 every time) while the other two stay healthy
+  # would never trip an aggregate "all three failed" counter, since two
+  # successes reset it every round — but that one broken endpoint could be
+  # exactly the one that would have shown the real response, and the
+  # watcher would run out the full --timeout and report an ordinary,
+  # misleadingly unremarkable "no new activity" instead of "reviews
+  # couldn't be checked the whole time." Each endpoint gets its own streak
+  # and can independently trigger the loud exit.
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    attempted=$((attempted + 1))
     if CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")"; then
-      succeeded=$((succeeded + 1))
+      REVIEWS_FAILURE_STREAK=0
     else
       CURRENT_REVIEWS_JSON='[]'
-      echo "Warning: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2
+      REVIEWS_FAILURE_STREAK=$((REVIEWS_FAILURE_STREAK + 1))
+      echo "Warning: failed to fetch reviews from the GitHub API ($REVIEWS_FAILURE_STREAK in a row)" >&2
+      if [ "$REVIEWS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
+        echo "Error: fetching reviews has failed $REVIEWS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real review response could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
+        exit 1
+      fi
     fi
   fi
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    attempted=$((attempted + 1))
     if CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")"; then
-      succeeded=$((succeeded + 1))
+      COMMENTS_FAILURE_STREAK=0
     else
       CURRENT_COMMENTS_JSON='[]'
-      echo "Warning: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2
+      COMMENTS_FAILURE_STREAK=$((COMMENTS_FAILURE_STREAK + 1))
+      echo "Warning: failed to fetch review comments from the GitHub API ($COMMENTS_FAILURE_STREAK in a row)" >&2
+      if [ "$COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
+        echo "Error: fetching review comments has failed $COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real inline comment could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
+        exit 1
+      fi
     fi
   fi
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
-    attempted=$((attempted + 1))
     if CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")"; then
-      succeeded=$((succeeded + 1))
+      ISSUE_COMMENTS_FAILURE_STREAK=0
     else
       CURRENT_ISSUE_COMMENTS_JSON='[]'
-      echo "Warning: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2
+      ISSUE_COMMENTS_FAILURE_STREAK=$((ISSUE_COMMENTS_FAILURE_STREAK + 1))
+      echo "Warning: failed to fetch issue comments from the GitHub API ($ISSUE_COMMENTS_FAILURE_STREAK in a row)" >&2
+      if [ "$ISSUE_COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
+        echo "Error: fetching issue comments has failed $ISSUE_COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real clean-pass response could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
+        exit 1
+      fi
     fi
-  fi
-
-  # A genuine, persistent problem (bad auth, revoked token, sustained
-  # outage) looks like every fetch failing, over and over — as opposed to
-  # one flaky fetch next to successful ones (handled above by just
-  # skipping it) or the ordinary case of running low on budget near the
-  # deadline (attempted stays 0, which deliberately does NOT count here —
-  # that's not a problem, it's just the watch ending naturally). Only a
-  # real "we tried and everything failed" round moves this counter; only
-  # after several of those in a row do we give up loudly instead of
-  # silently retrying for the rest of --timeout. See gotcha #28.
-  if [ "$attempted" -gt 0 ] && [ "$succeeded" -eq 0 ]; then
-    TOTAL_FAILURE_STREAK=$((TOTAL_FAILURE_STREAK + 1))
-    if [ "$TOTAL_FAILURE_STREAK" -ge "$MAX_TOTAL_FAILURES" ]; then
-      echo "Error: all GitHub API requests have failed $TOTAL_FAILURE_STREAK times in a row — this looks like a persistent problem (auth, rate limit, network), not a transient blip. Giving up rather than silently retrying for the rest of --timeout." >&2
-      exit 1
-    fi
-  elif [ "$succeeded" -gt 0 ]; then
-    TOTAL_FAILURE_STREAK=0
   fi
 
   NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_bot_and_id "$BASELINE_REVIEW_IDS" "$BOT_LOGIN")" \
@@ -678,11 +691,12 @@ poll_once() {
   return 1
 }
 
-# How many consecutive poll_once calls have seen every fetch fail (not
-# skipped for lack of budget — genuinely attempted and failed). See
-# gotcha #28.
-TOTAL_FAILURE_STREAK=0
-MAX_TOTAL_FAILURES=3
+# Per-endpoint consecutive-failure counts (not skipped for lack of budget —
+# genuinely attempted and failed). See gotcha #28/#29.
+REVIEWS_FAILURE_STREAK=0
+COMMENTS_FAILURE_STREAK=0
+ISSUE_COMMENTS_FAILURE_STREAK=0
+MAX_ENDPOINT_FAILURES=3
 
 # Unconditional first poll, before any deadline math — see gotcha #6. This is
 # the only way a --timeout at or below --interval (or just a fast responder)
