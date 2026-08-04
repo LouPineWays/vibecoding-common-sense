@@ -4,13 +4,19 @@
 # few minutes.
 #
 # Usage:
-#   ./watch-codex-review.sh <owner/repo> <pr-number> [--trigger] [--interval SECONDS] [--timeout SECONDS] [--bot LOGIN]
+#   ./watch-codex-review.sh <owner/repo> <pr-number> [--trigger] [--interval SECONDS] [--timeout SECONDS] [--bot LOGIN] [--trigger-comment TEXT]
 #
-#   --trigger        post "@codex review" as a new PR comment before watching
+#   --trigger        post a comment (see --trigger-comment) as a new PR comment
+#                    before watching
 #   --interval N     seconds between checks (default 20)
 #   --timeout N      give up after this many seconds (default 900 = 15 min)
 #   --bot LOGIN      .user.login to treat as the reviewer for the issue-comments
 #                    check (default "chatgpt-codex-connector[bot]") — see gotcha #18
+#   --trigger-comment TEXT
+#                    the comment body --trigger posts (default "@codex review").
+#                    Change this alongside --bot when watching a different
+#                    review-on-comment bot — Codex's trigger phrase won't summon
+#                    anyone else's bot. See gotcha #31.
 #
 # Exits 0 and prints a summary the moment a genuinely new review or review
 # comment (by ID, not just a changed count) appears after the watch started.
@@ -395,6 +401,16 @@
 #     slept away the whole remaining budget with none held back, landing
 #     right back on gotcha #25's original problem at that one specific
 #     boundary. Changed to `-ge`.
+#
+# 31. `--bot LOGIN` (gotcha #18) makes this script's own *detection* generic
+#     across review-on-comment bots, but `--trigger` still posted the
+#     hardcoded literal `"@codex review"` regardless — combine `--trigger`
+#     with `--bot other-reviewer[bot]` and the watcher summons nothing (that
+#     phrase means nothing to a different bot), then waits for a response
+#     to a request that was never actually made, and eventually times out.
+#     `--trigger-comment TEXT` (default `"@codex review"`, so existing
+#     invocations are unaffected) makes the posted body configurable too —
+#     set it alongside `--bot` when watching something other than Codex.
 
 set -euo pipefail
 
@@ -406,6 +422,7 @@ TRIGGER=false
 INTERVAL=20
 TIMEOUT=900
 BOT_LOGIN="chatgpt-codex-connector[bot]"
+TRIGGER_BODY="@codex review"
 # Seconds of budget deliberately left unslept before the deadline, so the
 # final poll wakes up with real time left instead of exactly zero — see
 # gotcha #21. Not a flag: it's an internal implementation margin, not
@@ -418,6 +435,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --bot) BOT_LOGIN="$2"; shift 2 ;;
+    --trigger-comment) TRIGGER_BODY="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -574,11 +592,11 @@ BASELINE_ISSUE_COMMENT_IDS="$(echo "$BASELINE_ISSUE_COMMENTS_JSON" | jq '[.[].id
 if [ "$TRIGGER" = true ]; then
   TRIGGER_REMAINING=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$TRIGGER_REMAINING" -le 0 ]; then
-    echo "Error: timed out before the @codex review trigger comment could be posted" >&2
+    echo "Error: timed out before the trigger comment could be posted" >&2
     exit 1
   fi
-  TRIGGER_OUTPUT="$(with_timeout "$TRIGGER_REMAINING" gh pr comment "$PR" --repo "$REPO" --body "@codex review")" \
-    || { echo "Error: failed to post the @codex review trigger comment (network issue, rate limit, or timeout)" >&2; exit 1; }
+  TRIGGER_OUTPUT="$(with_timeout "$TRIGGER_REMAINING" gh pr comment "$PR" --repo "$REPO" --body "$TRIGGER_BODY")" \
+    || { echo "Error: failed to post the trigger comment (network issue, rate limit, or timeout)" >&2; exit 1; }
   # gh prints the new comment's URL (".../pull/1#issuecomment-<id>") to
   # stdout. The issue-comments baseline was captured just above, BEFORE this
   # post, specifically so a fast response can't race past it (see the
@@ -590,7 +608,7 @@ if [ "$TRIGGER" = true ]; then
   if [ -n "$TRIGGER_COMMENT_ID" ]; then
     BASELINE_ISSUE_COMMENT_IDS="$(echo "$BASELINE_ISSUE_COMMENT_IDS" | jq --argjson id "$TRIGGER_COMMENT_ID" '. + [$id]')"
   fi
-  echo "Posted @codex review on $REPO#$PR"
+  echo "Posted \"$TRIGGER_BODY\" on $REPO#$PR"
 fi
 
 BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEW_IDS" | jq 'length')"

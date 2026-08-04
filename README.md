@@ -75,8 +75,9 @@ that) for up to 15 minutes (`--timeout`) and exits the moment a new review, new 
 comment, or new conversation comment from the reviewer bot shows up (including a clean
 "no findings" pass, which Codex posts as a plain comment rather than a formal review),
 printing a summary. If you're watching a different bot, pass its account name with
-`--bot <login>` (default `chatgpt-codex-connector[bot]`, Codex's own). Needs `gh`
-(authenticated) and `jq`.
+`--bot <login>` (default `chatgpt-codex-connector[bot]`, Codex's own) *and* whatever
+comment actually summons it with `--trigger-comment <text>` (default `"@codex review"`,
+which won't mean anything to a different bot). Needs `gh` (authenticated) and `jq`.
 
 If you're changing this script yourself, run `scripts/test/run-tests.sh` first —
 it exercises the timing/error-handling edge cases (partial failures, a persistently

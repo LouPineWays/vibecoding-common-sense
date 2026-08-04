@@ -121,6 +121,13 @@ run_case "finding-survives-concurrent-persistent-failure" 0 "comment by chatgpt-
   FAKE_GH_COMMENTS_SEQUENCE=1,2 \
   FAKE_GH_ISSUE_COMMENTS_SEQUENCE="1,2;1,2;1,2;1,2,3"
 
+# --trigger-comment should override the hardcoded "@codex review" -- the
+# whole point being that a different bot's summon phrase actually gets
+# posted, not Codex's, when --bot is pointed at someone else.
+EXTRA_ARGS=(--interval 2 --timeout 6 --trigger --trigger-comment "@other-bot please review")
+run_case "custom-trigger-comment-is-actually-posted" 1 "posted trigger body: @other-bot please review" -- \
+  FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
+
 EXTRA_ARGS=(--interval 20 --timeout 3)
 run_case "very-tight-timeout-still-attempts-and-stays-bounded" 1 "Timed out after 3s" -- \
   FAKE_GH_REVIEWS_SEQUENCE=1,2

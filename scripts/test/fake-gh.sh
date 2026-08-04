@@ -142,6 +142,13 @@ elif [ "${args[0]:-}" = "pr" ] && [ "${args[1]:-}" = "comment" ]; then
     echo "fake-gh: simulated trigger post error" >&2
     exit 1
   fi
+  body=""
+  for i in "${!args[@]}"; do
+    if [ "${args[$i]}" = "--body" ]; then
+      body="${args[$((i + 1))]}"
+    fi
+  done
+  echo "fake-gh: posted trigger body: $body" >&2
   echo "https://github.com/fake/repo/pull/1#issuecomment-999999"
 else
   echo "fake-gh: unhandled invocation: ${args[*]}" >&2
