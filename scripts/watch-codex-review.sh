@@ -92,14 +92,21 @@
 #    process it has to remember to separately clean up.
 #
 # 9. `remaining` can reach zero or go negative mid-`poll_once` — e.g. the
-#    reviews request used almost the whole budget, so the comments request
-#    recomputes a `remaining` of 0 right before it starts. Passed straight
+#    reviews request used almost the whole budget, so `remaining` recomputed
+#    right before the comments request is already <= 0. Passed straight
 #    through, that collides with `with_timeout`'s own "`<= 0` means
 #    unbounded" sentinel (intentional for the one-time baseline calls, which
-#    pass a literal `0`), so the comments request would run with no bound at
-#    all — the opposite of what an exhausted deadline should mean. Every
-#    `remaining` computed inside `poll_once` is clamped to at least 1 before
-#    it's passed on, so it's always a real bound during actual polling.
+#    pass `$TIMEOUT` — a real bound, see #11 below), so an exhausted budget
+#    would mean "no bound at all" — the opposite of the intent. An earlier
+#    version of this fix clamped `remaining` up to a minimum of 1 instead,
+#    which avoided the unbounded sentinel but is its own bug: it grants a
+#    bonus second to a request that shouldn't be attempted at all once the
+#    deadline has already passed, so `--timeout 1` could still run ~2
+#    seconds long. `poll_once` now checks `remaining <= 0` and returns
+#    (without attempting the request) before every `api_list` call instead
+#    of clamping — an exhausted budget is treated as "nothing new to report
+#    this round," identical to a normal empty check, and the outer loop's
+#    own deadline test is what turns that into the final timeout message.
 #
 # 10. `with_timeout` originally merged the wrapped command's stdout and
 #     stderr into one captured stream (`2>&1`). `gh` can write to stderr on
@@ -109,6 +116,15 @@
 #     API request itself worked. stdout and stderr are captured to separate
 #     files instead; stderr is still replayed to our own stderr afterward,
 #     so nothing is silently dropped, it just can't corrupt the JSON stream.
+#
+# 11. The two one-time baseline requests were bounded with a literal `0`
+#     ("unbounded"), and `START_TS` wasn't set until after they finished —
+#     so a stalled baseline request could hang forever before the watcher
+#     ever entered its own deadline-bounded loop, well past the advertised
+#     `--timeout`. `START_TS` is now set first, and both baseline requests
+#     are bounded by `$TIMEOUT` like everything else, so the whole script's
+#     "give up after this many seconds" promise actually covers its full
+#     run, not just the polling loop after setup.
 
 set -euo pipefail
 
@@ -189,14 +205,22 @@ new_by_id() {
   jq --argjson baseline "$1" '[.[] | select(.id as $i | ($baseline | index($i)) == null)]'
 }
 
+# The whole script's "give up after --timeout seconds" promise has to start
+# here, before the baseline requests, not after them — a stalled baseline
+# request bounded to 0 (unbounded) would otherwise hang forever before the
+# watcher ever entered its own deadline-bounded loop.
+START_TS=$(date +%s)
+
 # Snapshot the current state BEFORE posting the trigger comment, not after.
 # A review bot can respond fast enough that if the trigger goes out first,
 # its review and comments land inside what would become the "baseline" —
 # so the poll loop below would never see them as new and the watcher would
 # time out despite a real response.
-BASELINE_REVIEWS_JSON="$(api_list 0 "repos/$REPO/pulls/$PR/reviews")"
+BASELINE_REVIEWS_JSON="$(api_list "$TIMEOUT" "repos/$REPO/pulls/$PR/reviews")" \
+  || { echo "Error: failed to fetch the baseline reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 BASELINE_REVIEW_IDS="$(echo "$BASELINE_REVIEWS_JSON" | jq '[.[].id]')"
-BASELINE_COMMENTS_JSON="$(api_list 0 "repos/$REPO/pulls/$PR/comments")"
+BASELINE_COMMENTS_JSON="$(api_list "$TIMEOUT" "repos/$REPO/pulls/$PR/comments")" \
+  || { echo "Error: failed to fetch the baseline review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 BASELINE_COMMENT_IDS="$(echo "$BASELINE_COMMENTS_JSON" | jq '[.[].id]')"
 
 if [ "$TRIGGER" = true ]; then
@@ -208,22 +232,27 @@ BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEW_IDS" | jq 'length')"
 BASELINE_COMMENT_COUNT="$(echo "$BASELINE_COMMENT_IDS" | jq 'length')"
 echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENT_COUNT, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
-START_TS=$(date +%s)
-
 # Runs one check. Prints the "[Ns] ..." status line and, if either baseline
 # set gained an ID that wasn't there before, the "New activity" summary too.
 # Returns 0 (and has already printed the summary) when new activity was
-# found, 1 otherwise — the caller decides what to do with that.
+# found, 1 otherwise (including when the budget ran out mid-check, which
+# looks the same to the caller as "nothing new this round" — the outer
+# loop's own deadline check is what turns that into the final timeout
+# message, so this doesn't need to duplicate it).
 poll_once() {
   local remaining
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
-  [ "$remaining" -lt 1 ] && remaining=1
+  if [ "$remaining" -le 0 ]; then
+    return 1
+  fi
   CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
     || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
-  [ "$remaining" -lt 1 ] && remaining=1
+  if [ "$remaining" -le 0 ]; then
+    return 1
+  fi
   CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
     || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
