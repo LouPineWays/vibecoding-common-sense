@@ -145,6 +145,10 @@ Two things to actually do differently once you notice you're in this loop:
   minutes each. Still paying the external round-trip tax for iteration five is itself a
   sign you're testing symptoms, not the actual fix.
 
+For the longer version of this exact story — what the ~20 narrow-fix rounds actually looked
+like before anyone stopped to diagnose, and four more concrete techniques for cutting the
+round count next time — see [`docs/review-loop-case-study.md`](docs/review-loop-case-study.md).
+
 ## Multi-agent collaboration
 
 If you use more than one AI coding tool against this repo (Claude Code, Codex, others),
