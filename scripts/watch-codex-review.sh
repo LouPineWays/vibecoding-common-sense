@@ -253,6 +253,21 @@
 #     stops `$FINAL_POLL_RESERVE` seconds short instead, so the wake-up
 #     genuinely has a few seconds of positive budget left rather than
 #     exactly zero — enough for a normal, healthy API call to complete.
+#
+# 22. #21's reserve fixed the "no attempt at all" problem but created a new
+#     one: once `SLEEP_FOR` gets capped (the reserve window), it's clamped
+#     to 0 whenever `REMAINING` is already below `$FINAL_POLL_RESERVE` — and
+#     if `poll_once` returns without finding anything while `REMAINING` is
+#     *still* barely positive (the reserve wasn't fully used, or the poll
+#     was just fast), the loop goes right back to the top, sees the same
+#     "capped sleep" condition, and does it again — sleep 0, three more
+#     paginated requests, repeat — until `REMAINING` finally ticks down to
+#     zero. A short `--timeout` could burn several rounds of API calls in
+#     its last few seconds instead of the one intended reserved check.
+#     Entering the capped-sleep branch now means this loop iteration IS the
+#     reserved final poll, full stop: it runs once, and the loop always
+#     exits right after — win or lose — rather than looping back to
+#     re-evaluate whether another one is warranted.
 
 set -euo pipefail
 
@@ -528,6 +543,7 @@ while :; do
     break
   fi
   SLEEP_FOR=$INTERVAL
+  FINAL_ITERATION=false
   if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
     # This sleep would otherwise run all the way to the deadline — stop
     # $FINAL_POLL_RESERVE seconds short instead, so poll_once wakes up with
@@ -536,6 +552,7 @@ while :; do
     if [ "$SLEEP_FOR" -lt 0 ]; then
       SLEEP_FOR=0
     fi
+    FINAL_ITERATION=true
   fi
   sleep "$SLEEP_FOR"
 
@@ -545,6 +562,17 @@ while :; do
   # would only ever throw away the one poll that covers activity arriving
   # right up to the deadline, for no real savings.
   poll_once && exit 0
+
+  # Once REMAINING was small enough to cap the sleep, this IS the reserved
+  # final poll — stop here rather than looping back. Without this, a small
+  # leftover REMAINING (the reserve wasn't fully consumed, or poll_once
+  # itself was fast) sends the loop right back into the same "SLEEP_FOR
+  # capped to ~0" branch on the next iteration, busy-polling — three more
+  # paginated requests, back to back, with no sleep — for however many
+  # seconds it takes REMAINING to actually tick down to zero. See gotcha #22.
+  if [ "$FINAL_ITERATION" = true ]; then
+    break
+  fi
 done
 
 echo "Timed out after ${TIMEOUT}s with no new review activity on $REPO#$PR."
