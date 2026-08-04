@@ -15,7 +15,7 @@
 #
 # Requires: gh (authenticated), jq
 #
-# Two gotchas this script exists to get right:
+# Gotchas this script exists to get right:
 #
 # 1. `gh api --jq <expr>` only accepts a single query-string argument — it
 #    does NOT understand jq's own flags like `--arg`. `gh api ... --jq --arg
@@ -31,6 +31,19 @@
 #    unchanged to this script forever. `--paginate --slurp` fetches every
 #    page and wraps them as an array of per-page arrays, so `jq 'add'`
 #    flattens them back into one real list — see api_list() below.
+#
+# 3. Detecting "new reviews" by comparing `submitted_at` to a captured
+#    timestamp has a second-resolution race: a review submitted in the same
+#    UTC second the baseline was captured compares equal, not greater, and
+#    a strict `>` would silently miss it. Comparing review IDs against a
+#    baseline ID set (the same way the comment count already worked) has no
+#    such boundary, so that's what this script does instead of timestamps.
+#
+# 4. `sleep "$INTERVAL"` every iteration means the script can run well past
+#    `--timeout` — once for a timeout shorter than one interval, and every
+#    time for the seconds spent actually making the paginated API requests,
+#    which are never subtracted from the budget. This script tracks wall-clock
+#    elapsed time from a fixed start and caps each sleep at whatever's left.
 
 set -euo pipefail
 
@@ -58,14 +71,12 @@ api_list() {
 
 # Snapshot the current state BEFORE posting the trigger comment, not after.
 # A review bot can respond fast enough that if the trigger goes out first,
-# its review lands with a timestamp older than SINCE and its comments are
-# already folded into the "baseline" — so the poll loop below would never
-# see it as new and the watcher would time out despite a real response.
-#
-# Everything below is compared against this timestamp, not a specific commit
-# SHA, so it also catches reviews that land with no inline comments at all
-# (a plain approval, or a "looks good").
-SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# its review and comments land inside what would become the "baseline" —
+# so the poll loop below would never see them as new and the watcher would
+# time out despite a real response.
+BASELINE_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
+BASELINE_REVIEW_IDS="$(echo "$BASELINE_REVIEWS_JSON" | jq '[.[].id]')"
+BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEWS_JSON" | jq 'length')"
 BASELINE_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
 
 if [ "$TRIGGER" = true ]; then
@@ -73,23 +84,36 @@ if [ "$TRIGGER" = true ]; then
   echo "Posted @codex review on $REPO#$PR"
 fi
 
-echo "Watching $REPO#$PR since $SINCE (baseline review comments: $BASELINE_COMMENTS, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
+echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENTS, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
-ELAPSED=0
-while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
+START_TS=$(date +%s)
+while :; do
+  NOW_TS=$(date +%s)
+  ELAPSED=$((NOW_TS - START_TS))
+  REMAINING=$((TIMEOUT - ELAPSED))
+  if [ "$REMAINING" -le 0 ]; then
+    break
+  fi
+  SLEEP_FOR=$INTERVAL
+  if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
+    SLEEP_FOR=$REMAINING
+  fi
+  sleep "$SLEEP_FOR"
 
-  NEW_REVIEWS="$(api_list "repos/$REPO/pulls/$PR/reviews" | jq --arg since "$SINCE" '[.[] | select(.submitted_at > $since)] | length')"
+  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
+  CURRENT_REVIEW_COUNT="$(echo "$CURRENT_REVIEWS_JSON" | jq 'length')"
   CURRENT_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
 
-  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEWS, review comments: $CURRENT_COMMENTS (was $BASELINE_COMMENTS)"
+  NOW_TS=$(date +%s)
+  ELAPSED=$((NOW_TS - START_TS))
+  echo "  [${ELAPSED}s] reviews: $CURRENT_REVIEW_COUNT (was $BASELINE_REVIEW_COUNT), review comments: $CURRENT_COMMENTS (was $BASELINE_COMMENTS)"
 
-  if [ "$NEW_REVIEWS" -gt 0 ] || [ "$CURRENT_COMMENTS" -ne "$BASELINE_COMMENTS" ]; then
+  if [ "$CURRENT_REVIEW_COUNT" -ne "$BASELINE_REVIEW_COUNT" ] || [ "$CURRENT_COMMENTS" -ne "$BASELINE_COMMENTS" ]; then
     echo
     echo "New activity on $REPO#$PR:"
-    api_list "repos/$REPO/pulls/$PR/reviews" \
-      | jq --arg since "$SINCE" -r '.[] | select(.submitted_at > $since) | "- review by \(.user.login): \(.state)"'
+    echo "$CURRENT_REVIEWS_JSON" \
+      | jq --argjson baseline "$BASELINE_REVIEW_IDS" -r \
+        '.[] | select(.id as $i | ($baseline | index($i)) == null) | "- review by \(.user.login): \(.state)"'
     api_list "repos/$REPO/pulls/$PR/comments" \
       | jq -r --argjson skip "$BASELINE_COMMENTS" \
         '.[$skip:] | .[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
