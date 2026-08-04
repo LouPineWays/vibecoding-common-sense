@@ -207,6 +207,39 @@
 #     expected reviewer's identity explicit and configurable, and
 #     `new_bot_comments_by_id` now matches `.user.login == $bot` instead of
 #     the generic account type.
+#
+# 19. The outer loop rechecked the deadline a second time right after waking
+#     from sleep, before calling `poll_once` — added back when `poll_once`
+#     had no internal budget awareness of its own, specifically to stop it
+#     from starting a real round of paginated requests after the timeout had
+#     already passed. `poll_once` has since grown its own per-call
+#     `remaining <= 0` guards (the whole point of gotcha #9), so calling it
+#     when the budget is already gone now costs a `date` call and a
+#     comparison, not a wasted request. The outer recheck had become pure
+#     downside: since `SLEEP_FOR` is capped to exactly `REMAINING`, that
+#     recheck was *guaranteed* to see the deadline as reached and skip the
+#     call — discarding the one poll that covers activity arriving anywhere
+#     up to and including the deadline itself, every single run. Removed;
+#     `poll_once && exit 0` runs unconditionally after every sleep now.
+#
+# 20. Known, accepted gap, not fixed: the reviews/comments/issue-comments
+#     baselines are three sequential requests, not one atomic snapshot — the
+#     GitHub REST API doesn't offer a way to fetch all three at once. If
+#     `--trigger` is omitted (the review was requested some other way) and
+#     the bot responds while baseline capture is still in flight, its ID can
+#     land inside the baseline instead of being seen as new, and the watcher
+#     times out despite a real response — the same shape of problem #15/#18
+#     solved for the `--trigger` path by baselining before this script's own
+#     trigger post. There's no equivalent anchor point in the no-trigger
+#     case: the review was requested by something outside this script, at a
+#     time this script has no way to know. Closing this fully would mean
+#     comparing `created_at` against `START_TS` instead of ID-set
+#     membership, which reintroduces the exact second-resolution race #4
+#     moved away from ID comparison to avoid — trading one narrow race for
+#     another, not eliminating it. Left as documented risk instead: narrow
+#     in practice, since it only fires if the bot responds within the few
+#     seconds baseline capture takes, and every real response observed
+#     while building this script took multiple minutes.
 
 set -euo pipefail
 
@@ -482,11 +515,11 @@ while :; do
   fi
   sleep "$SLEEP_FOR"
 
-  NOW_TS=$(date +%s)
-  if [ "$((TIMEOUT - (NOW_TS - START_TS)))" -le 0 ]; then
-    break
-  fi
-
+  # No deadline recheck here — see gotcha #19. poll_once already bails
+  # near-instantly on its own if the budget's gone by the time it's called,
+  # so skipping this call when SLEEP_FOR was capped to exactly REMAINING
+  # would only ever throw away the one poll that covers activity arriving
+  # right up to the deadline, for no real savings.
   poll_once && exit 0
 done
 
