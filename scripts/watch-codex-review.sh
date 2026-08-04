@@ -240,6 +240,19 @@
 #     in practice, since it only fires if the bot responds within the few
 #     seconds baseline capture takes, and every real response observed
 #     while building this script took multiple minutes.
+#
+# 21. #19's "just remove the outer recheck" fix didn't actually fix
+#     anything — it moved the exact same problem one level deeper.
+#     `poll_once`'s own top-of-function guard checks `remaining <= 0`
+#     before its *first* request, and since `SLEEP_FOR` is capped to
+#     exactly `REMAINING`, waking up from that final sleep always lands on
+#     `remaining` being ~0 — so that guard was *just as guaranteed* to bail
+#     before attempting anything as the outer recheck it replaced. The real
+#     fix has to change what gets slept, not which guard skips the call:
+#     when the capped sleep would run all the way to the deadline, it now
+#     stops `$FINAL_POLL_RESERVE` seconds short instead, so the wake-up
+#     genuinely has a few seconds of positive budget left rather than
+#     exactly zero — enough for a normal, healthy API call to complete.
 
 set -euo pipefail
 
@@ -251,6 +264,11 @@ TRIGGER=false
 INTERVAL=20
 TIMEOUT=900
 BOT_LOGIN="chatgpt-codex-connector[bot]"
+# Seconds of budget deliberately left unslept before the deadline, so the
+# final poll wakes up with real time left instead of exactly zero — see
+# gotcha #21. Not a flag: it's an internal implementation margin, not
+# something callers should need to tune.
+FINAL_POLL_RESERVE=3
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -511,7 +529,13 @@ while :; do
   fi
   SLEEP_FOR=$INTERVAL
   if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
-    SLEEP_FOR=$REMAINING
+    # This sleep would otherwise run all the way to the deadline — stop
+    # $FINAL_POLL_RESERVE seconds short instead, so poll_once wakes up with
+    # real budget left rather than exactly zero. See gotcha #21.
+    SLEEP_FOR=$((REMAINING - FINAL_POLL_RESERVE))
+    if [ "$SLEEP_FOR" -lt 0 ]; then
+      SLEEP_FOR=0
+    fi
   fi
   sleep "$SLEEP_FOR"
 
