@@ -22,7 +22,6 @@ exact words.
 |---|---|
 | [`CLAUDE.md.template`](CLAUDE.md.template) | Drop-in project rules: branch-safety, "check don't read" for status claims, file-safety, house-style conventions, multi-agent review. Copy to `CLAUDE.md` (and `AGENTS.md` if you also run Codex) at your repo root. |
 | [`.claude/skills/model-check/`](.claude/skills/model-check/SKILL.md) | A skill that scores the task in front of you and recommends the cheapest model/effort tier that's still safe for it, instead of defaulting to the most expensive one out of habit. Includes an optional script for dispatching trivial tasks to a free local model. |
-| [`.claude/skills/humanize/`](.claude/skills/humanize/SKILL.md) | A checklist skill for stripping the statistical tells of AI-generated writing out of short public copy (store listings, pinned comments, changelog notes) before you publish it. |
 | [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
 | [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) | Five checks to run before requesting review, so common review-round-inflating mistakes get caught before an external reviewer sees the diff instead of after. |
 
@@ -30,8 +29,8 @@ exact words.
 
 1. Copy `CLAUDE.md.template` to `CLAUDE.md` at the root of your repo (and to `AGENTS.md`
    too, if you also run Codex against the same repo).
-2. Copy `.claude/skills/model-check/` and `.claude/skills/humanize/` into your own
-   `.claude/skills/` directory, and `scripts/watch-codex-review.sh` into your own repo (a
+2. Copy `.claude/skills/model-check/` into your own `.claude/skills/` directory, and
+   `scripts/watch-codex-review.sh` into your own repo (a
    top-level `scripts/` directory works, or wherever you keep repo tooling) — the copied
    `CLAUDE.md` references it by that relative path.
 3. Read through what you copied and delete anything that doesn't apply. The file-safety
