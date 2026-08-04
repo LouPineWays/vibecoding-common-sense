@@ -71,8 +71,12 @@ does that waiting for you:
 
 `--trigger` posts `@codex review` for you first; drop it if you already triggered the
 review yourself and just want to watch. It polls every 20 seconds (`--interval` to change
-that) for up to 15 minutes (`--timeout`) and exits the moment new review comments or a new
-review show up, printing a summary. Needs `gh` (authenticated) and `jq`.
+that) for up to 15 minutes (`--timeout`) and exits the moment a new review, new inline
+comment, or new conversation comment from the reviewer bot shows up (including a clean
+"no findings" pass, which Codex posts as a plain comment rather than a formal review),
+printing a summary. If you're watching a different bot, pass its account name with
+`--bot <login>` (default `chatgpt-codex-connector[bot]`, Codex's own). Needs `gh`
+(authenticated) and `jq`.
 
 The script's own header comment explains the one bug worth knowing about if you write
 anything similar yourself: `gh api --jq <expr>` takes a single query-string argument and

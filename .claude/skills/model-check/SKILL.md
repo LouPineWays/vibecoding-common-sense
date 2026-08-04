@@ -112,10 +112,17 @@ capability and judgment does this need" axes, independent of how hard it has to 
 | 2-4 | Mid-tier model (e.g. Sonnet) |
 | 5-6 | Top-tier model (e.g. Opus) |
 
-*At sum 0-1, also check the tool-use gate above: if the task needs no repo/tool access and
-no project-specific context, recommend a **local model (free)** instead and say so
-explicitly — that's the actual win here, since it costs nothing. If it needs tools or
-project context even at sum 0-1, stay on the smallest hosted model.
+*At sum 0-1, recommending a local model needs two things to both hold, not just one:
+the tool-use gate above (no repo/tool access, no project-specific context needed), AND
+reasoning depth scored 0-1, not 2. A fully self-contained, pasted-in task can still need
+real reasoning — a subtle bug in a snippet someone pastes you can score 0 on novelty/
+ambiguity/blast-radius (nothing new, fully specified, throwaway) while reasoning depth
+is 2 (finding it takes real judgment), and that's exactly the "judgment about what's
+correct" case the local-model description above already calls a poor fit — a local
+model can't verify itself against anything, pasted snippet included. Only recommend
+**local model (free)** and say so explicitly when the tool-use gate passes AND
+reasoning depth is also 0-1. Otherwise — tools/context needed, or reasoning depth 2 —
+stay on the smallest hosted model.
 
 ## Stage 2: pick the effort (skip for tiers with no effort dial)
 

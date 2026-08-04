@@ -4,11 +4,13 @@
 # few minutes.
 #
 # Usage:
-#   ./watch-codex-review.sh <owner/repo> <pr-number> [--trigger] [--interval SECONDS] [--timeout SECONDS]
+#   ./watch-codex-review.sh <owner/repo> <pr-number> [--trigger] [--interval SECONDS] [--timeout SECONDS] [--bot LOGIN]
 #
 #   --trigger        post "@codex review" as a new PR comment before watching
 #   --interval N     seconds between checks (default 20)
 #   --timeout N      give up after this many seconds (default 900 = 15 min)
+#   --bot LOGIN      .user.login to treat as the reviewer for the issue-comments
+#                    check (default "chatgpt-codex-connector[bot]") — see gotcha #18
 #
 # Exits 0 and prints a summary the moment a genuinely new review or review
 # comment (by ID, not just a changed count) appears after the watch started.
@@ -177,12 +179,10 @@
 #     conversation thread, not a review-response channel — anyone can post
 #     there. Treating any new comment there as "Codex responded" means a
 #     human saying literally anything on the PR while the watcher is running
-#     produces a false success. `new_bot_comments_by_id` filters to
-#     `.user.type == "Bot"` before checking for a new ID, so only an actual
-#     bot account's comment counts. Reviews and inline review comments don't
-#     need the same filter — submitting a formal review or an inline code
-#     comment is inherently review-shaped regardless of who does it, unlike
-#     a general-purpose comment thread.
+#     produces a false success. `new_bot_comments_by_id` originally filtered
+#     to `.user.type == "Bot"` before checking for a new ID — narrowed
+#     further to a specific bot login in #18 below, once it turned out "any
+#     bot" had the same problem as "any commenter."
 #
 # 17. Known, accepted gap, not fixed: `START_TS` and every `remaining`/
 #     `ELAPSED` computation use `date +%s`, which truncates to whole
@@ -197,6 +197,16 @@
 #     use them waiting on a review bot that typically takes minutes to
 #     respond, so the fix was judged not worth trading away the portability
 #     every other timing fix in this script was written to protect.
+#
+# 18. #16's `.user.type == "Bot"` filter was still too wide: it accepts a
+#     comment from *any* bot account, and a repo can easily run more than
+#     one — a CI status bot, a deploy bot, a coverage reporter — any of
+#     which posting on the PR while this is watching would be wrongly
+#     treated as "Codex responded." `--bot LOGIN` (default
+#     `chatgpt-codex-connector[bot]`, Codex's actual `.user.login`) makes the
+#     expected reviewer's identity explicit and configurable, and
+#     `new_bot_comments_by_id` now matches `.user.login == $bot` instead of
+#     the generic account type.
 
 set -euo pipefail
 
@@ -207,12 +217,14 @@ shift 2
 TRIGGER=false
 INTERVAL=20
 TIMEOUT=900
+BOT_LOGIN="chatgpt-codex-connector[bot]"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --trigger) TRIGGER=true; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
+    --bot) BOT_LOGIN="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -314,13 +326,15 @@ new_by_id() {
 
 # Same as new_by_id, but for the issue-comments endpoint specifically, where
 # any PR participant — not just review bots — can post. Restricted to
-# .user.type == "Bot" so an ordinary human conversation comment posted while
-# the watcher is running can't be mistaken for a completed review response.
+# .user.login == $2 (a specific bot account, not just any bot — a repo can
+# easily have a CI, deploy, or coverage bot also posting on the same PR, and
+# any of those passing "is this Codex" would be as wrong as a human comment
+# passing it) so only the actual requested reviewer's comment counts.
 # Reviews and inline review comments don't need this: submitting a formal
 # review or an inline code comment is inherently review-shaped regardless of
 # who does it, unlike a general-purpose conversation thread.
 new_bot_comments_by_id() {
-  jq --argjson baseline "$1" '[.[] | select(.user.type == "Bot") | select(.id as $i | ($baseline | index($i)) == null)]'
+  jq --argjson baseline "$1" --arg bot "$2" '[.[] | select(.user.login == $bot) | select(.id as $i | ($baseline | index($i)) == null)]'
 }
 
 # The whole script's "give up after --timeout seconds" promise has to start
@@ -431,7 +445,7 @@ poll_once() {
     || { echo "Error: failed to compute new reviews" >&2; exit 1; }
   NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")" \
     || { echo "Error: failed to compute new review comments" >&2; exit 1; }
-  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_bot_comments_by_id "$BASELINE_ISSUE_COMMENT_IDS")" \
+  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_bot_comments_by_id "$BASELINE_ISSUE_COMMENT_IDS" "$BOT_LOGIN")" \
     || { echo "Error: failed to compute new issue comments" >&2; exit 1; }
   NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')" || exit 1
   NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')" || exit 1
