@@ -173,3 +173,11 @@ and still verify its claims independently before merging, the same as you would 
 change you wrote yourself. `scripts/watch-codex-review.sh <owner/repo> <pr-number>
 --trigger` (in this pack) requests that review and polls for the response instead of you
 checking back on the PR by hand.
+
+**Before requesting that review, run the pre-flight checklist, not just the diff.** The
+"stop and diagnose" rule above is the reactive version of this lesson — what to do once you're
+already a few patches deep into the same spot. This is the proactive version: five checks, run
+before the first review request goes out, that catch the same failure modes before an external
+reviewer ever sees the diff instead of after round two or three. See
+[`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) — especially before re-requesting
+review on a function you've already touched once for a finding.
