@@ -61,6 +61,27 @@
 #    instant response is never observed. The fix is to poll once
 #    unconditionally before the deadline-bounded loop even starts, then let
 #    that loop's sleep-then-recheck logic govern every poll after the first.
+#
+# 7. Calling a function as the left side of `&&` (as poll_once is, both here
+#    and in the loop) disables `set -e` for every command inside that
+#    function, not just its own return value — a well-known bash gotcha. If
+#    a `gh api` call inside poll_once fails (rate limit, network blip), the
+#    assignment silently keeps going with empty/garbage JSON instead of
+#    stopping, and later commands can fail confusingly (`jq`/`[` erroring on
+#    empty input) or, worse, just report a misleading timeout instead of the
+#    real error. Every command inside poll_once that can fail is checked
+#    explicitly with `|| exit 1` instead of relying on errexit to catch it.
+#
+# 8. None of the above bounds an individual `gh api` call itself — a request
+#    that stalls (or a slow/rate-limited response) can still block past
+#    `--timeout` on its own, however tight the sleep/deadline logic around it
+#    is. `with_timeout` below bounds each request to whatever's left of the
+#    budget. It's hand-rolled with a background process and `kill` rather
+#    than calling the `timeout` command, because `timeout` isn't part of a
+#    stock macOS install (only Linux and Git-for-Windows ship it by
+#    default) — depending on it would silently break for a chunk of users
+#    the first time a request actually hangs, which is exactly when you'd
+#    want this to work.
 
 set -euo pipefail
 
@@ -81,9 +102,41 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Fetches every page of a list endpoint and returns it as one flat JSON array.
+# Runs "$@", capturing its stdout, but kills it and returns non-zero if it's
+# still running after $1 seconds. $1 <= 0 means "no bound" — used for the
+# one-time baseline calls below, which happen before there's any deadline to
+# measure against.
+with_timeout() {
+  local secs="$1"; shift
+  if [ "$secs" -le 0 ]; then
+    "$@"
+    return $?
+  fi
+  local out
+  out="$(mktemp)"
+  "$@" >"$out" 2>&1 &
+  local pid=$!
+  ( sleep "$secs" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) &
+  local watcher=$!
+  local status=0
+  wait "$pid" 2>/dev/null || status=$?
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  cat "$out"
+  rm -f "$out"
+  return "$status"
+}
+
+# Fetches every page of a list endpoint and returns it as one flat JSON
+# array, bounding the network request to $1 seconds (<= 0 for unbounded).
+# Returns non-zero (and prints nothing) if the request failed or timed out —
+# checked explicitly by callers rather than left to errexit, since errexit
+# is disabled inside any function invoked as the left side of `&&` (see
+# gotcha #7), which is exactly how this gets called from poll_once.
 api_list() {
-  gh api --paginate --slurp "$1" | jq 'add'
+  local bound_secs="$1" path="$2" raw
+  raw="$(with_timeout "$bound_secs" gh api --paginate --slurp "$path")" || return 1
+  printf '%s' "$raw" | jq 'add'
 }
 
 # Reads a JSON array on stdin, returns the elements whose .id isn't present
@@ -97,9 +150,9 @@ new_by_id() {
 # its review and comments land inside what would become the "baseline" —
 # so the poll loop below would never see them as new and the watcher would
 # time out despite a real response.
-BASELINE_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
+BASELINE_REVIEWS_JSON="$(api_list 0 "repos/$REPO/pulls/$PR/reviews")"
 BASELINE_REVIEW_IDS="$(echo "$BASELINE_REVIEWS_JSON" | jq '[.[].id]')"
-BASELINE_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
+BASELINE_COMMENTS_JSON="$(api_list 0 "repos/$REPO/pulls/$PR/comments")"
 BASELINE_COMMENT_IDS="$(echo "$BASELINE_COMMENTS_JSON" | jq '[.[].id]')"
 
 if [ "$TRIGGER" = true ]; then
@@ -118,12 +171,22 @@ START_TS=$(date +%s)
 # Returns 0 (and has already printed the summary) when new activity was
 # found, 1 otherwise — the caller decides what to do with that.
 poll_once() {
-  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
-  CURRENT_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
-  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")"
-  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")"
-  NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')"
-  NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')"
+  local remaining
+
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
+    || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
+    || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+
+  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")" \
+    || { echo "Error: failed to compute new reviews" >&2; exit 1; }
+  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")" \
+    || { echo "Error: failed to compute new review comments" >&2; exit 1; }
+  NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')" || exit 1
+  NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')" || exit 1
 
   ELAPSED=$(( $(date +%s) - START_TS ))
   echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT"
