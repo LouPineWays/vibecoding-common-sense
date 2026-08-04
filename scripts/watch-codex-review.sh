@@ -15,14 +15,22 @@
 #
 # Requires: gh (authenticated), jq
 #
-# The one gotcha this script exists to get right: `gh api --jq <expr>` only
-# accepts a single query-string argument — it does NOT understand jq's own
-# flags like `--arg`. `gh api ... --jq --arg since "$SINCE" '...'` silently
-# mis-parses: `--jq` swallows the literal string "--arg" as its entire query,
-# and `since`, `$SINCE`, and the real filter all become stray positional
-# arguments, which gh then rejects (or, worse, just no-ops). If you need a
-# parametrized filter, pipe the raw JSON into the real `jq` binary instead —
-# that's what every query below does, on purpose.
+# Two gotchas this script exists to get right:
+#
+# 1. `gh api --jq <expr>` only accepts a single query-string argument — it
+#    does NOT understand jq's own flags like `--arg`. `gh api ... --jq --arg
+#    since "$SINCE" '...'` silently mis-parses: `--jq` swallows the literal
+#    string "--arg" as its entire query, and `since`, `$SINCE`, and the real
+#    filter all become stray positional arguments, which gh then rejects (or,
+#    worse, just no-ops). If you need a parametrized filter, pipe the raw
+#    JSON into the real `jq` binary instead — that's what every query below
+#    does, on purpose.
+#
+# 2. Plain `gh api <list-endpoint>` only returns the first page (30 items by
+#    default). A PR with more history than that would silently look
+#    unchanged to this script forever. `--paginate --slurp` fetches every
+#    page and wraps them as an array of per-page arrays, so `jq 'add'`
+#    flattens them back into one real list — see api_list() below.
 
 set -euo pipefail
 
@@ -43,6 +51,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Fetches every page of a list endpoint and returns it as one flat JSON array.
+api_list() {
+  gh api --paginate --slurp "$1" | jq 'add'
+}
+
 if [ "$TRIGGER" = true ]; then
   gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null
   echo "Posted @codex review on $REPO#$PR"
@@ -52,7 +65,7 @@ fi
 # SHA, so it also catches reviews that land with no inline comments at all
 # (a plain approval, or a "looks good").
 SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-BASELINE_COMMENTS="$(gh api "repos/$REPO/pulls/$PR/comments" | jq 'length')"
+BASELINE_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
 
 echo "Watching $REPO#$PR since $SINCE (baseline review comments: $BASELINE_COMMENTS, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
@@ -61,17 +74,17 @@ while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
   sleep "$INTERVAL"
   ELAPSED=$((ELAPSED + INTERVAL))
 
-  NEW_REVIEWS="$(gh api "repos/$REPO/pulls/$PR/reviews" | jq --arg since "$SINCE" '[.[] | select(.submitted_at > $since)] | length')"
-  CURRENT_COMMENTS="$(gh api "repos/$REPO/pulls/$PR/comments" | jq 'length')"
+  NEW_REVIEWS="$(api_list "repos/$REPO/pulls/$PR/reviews" | jq --arg since "$SINCE" '[.[] | select(.submitted_at > $since)] | length')"
+  CURRENT_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
 
   echo "  [${ELAPSED}s] new reviews: $NEW_REVIEWS, review comments: $CURRENT_COMMENTS (was $BASELINE_COMMENTS)"
 
   if [ "$NEW_REVIEWS" -gt 0 ] || [ "$CURRENT_COMMENTS" -ne "$BASELINE_COMMENTS" ]; then
     echo
     echo "New activity on $REPO#$PR:"
-    gh api "repos/$REPO/pulls/$PR/reviews" \
+    api_list "repos/$REPO/pulls/$PR/reviews" \
       | jq --arg since "$SINCE" -r '.[] | select(.submitted_at > $since) | "- review by \(.user.login): \(.state)"'
-    gh api "repos/$REPO/pulls/$PR/comments" \
+    api_list "repos/$REPO/pulls/$PR/comments" \
       | jq -r --argjson skip "$BASELINE_COMMENTS" \
         '.[$skip:] | .[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     exit 0
