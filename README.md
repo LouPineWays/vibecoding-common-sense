@@ -24,6 +24,7 @@ exact words.
 | [`.claude/skills/model-check/`](.claude/skills/model-check/SKILL.md) | A skill that scores the task in front of you and recommends the cheapest model/effort tier that's still safe for it, instead of defaulting to the most expensive one out of habit. Includes an optional script for dispatching trivial tasks to a free local model. |
 | [`.claude/skills/humanize/`](.claude/skills/humanize/SKILL.md) | A checklist skill for stripping the statistical tells of AI-generated writing out of short public copy (store listings, pinned comments, changelog notes) before you publish it. |
 | [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
+| [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) | Five checks to run before requesting review, so common review-round-inflating mistakes get caught before an external reviewer sees the diff instead of after. |
 
 ## Quickstart
 
@@ -85,7 +86,9 @@ broken API, a tight timeout, bot filtering) against a fake `gh` in a few seconds
 instead of you finding out about them one at a time from a real bot review that takes
 minutes to respond. See `CLAUDE.md.template`, "When one spot keeps needing fixes," for
 why that harness exists at all, and [`docs/review-loop-case-study.md`](docs/review-loop-case-study.md)
-for the full account of the 26-round loop that rule and this harness came out of.
+for the full account of the 26-round loop that rule and this harness came out of. Before you
+request review in the first place, [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md)
+turns that case study's lessons into five checks you can run up front.
 
 The script's own header comment explains the one bug worth knowing about if you write
 anything similar yourself: `gh api --jq <expr>` takes a single query-string argument and
