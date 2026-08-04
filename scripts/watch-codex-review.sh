@@ -146,6 +146,16 @@
 #     broken input into "run forever" instead of a clear, immediate error.
 #     `--timeout` (and `--interval`, same risk class) are validated as
 #     positive integers right after argument parsing, before anything runs.
+#
+# 14. `with_timeout`'s completion check only ran once a second — fine for
+#     actually catching a stall, but it means a command that finishes in,
+#     say, 50ms can still sit through most of a second before the next
+#     `kill -0` notices it's done. That's not free: `poll_once` makes two
+#     of these calls, baseline setup makes two more, and a fast, healthy
+#     response pays that ~1s tax on every single one of them — enough that
+#     a `--timeout` in the low single digits could expire before a single
+#     real request even finished, independent of the network. Polling every
+#     0.1s instead of every 1s cuts that worst case by 10x.
 
 set -euo pipefail
 
@@ -217,9 +227,14 @@ with_timeout() {
   err="$(mktemp)"
   "$@" >"$out" 2>"$err" &
   local pid=$!
-  local waited=0
+  # Poll every 0.1s (tenths, since bash arithmetic is integer-only), not
+  # every 1s — seven of these run per poll_once call (two baseline, two per
+  # poll), and every one that lets a fast completion sit through a needless
+  # ~1s sleep before noticing adds up. See gotcha #14.
+  local deadline_ticks=$((secs * 10))
+  local ticks=0
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$secs" ]; then
+    if [ "$ticks" -ge "$deadline_ticks" ]; then
       kill -TERM "$pid" 2>/dev/null
       wait "$pid" 2>/dev/null
       cat "$err" >&2
@@ -227,8 +242,8 @@ with_timeout() {
       rm -f "$out" "$err"
       return 124
     fi
-    sleep 1
-    waited=$((waited + 1))
+    sleep 0.1
+    ticks=$((ticks + 1))
   done
   wait "$pid" 2>/dev/null
   local status=$?
