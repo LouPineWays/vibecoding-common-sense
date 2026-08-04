@@ -51,9 +51,16 @@
 #    still sleeps the full interval, and every time because the seconds
 #    spent actually making the paginated API requests are never subtracted
 #    from the budget. This script tracks wall-clock elapsed time from a
-#    fixed start, caps each sleep at whatever's left, and rechecks the
-#    deadline again right after waking up — before spending any more time on
-#    API calls — so a request only ever starts while time still remains.
+#    fixed start and caps each sleep at whatever's left.
+#
+# 6. "Cap sleep at whatever's left" and "always poll at least once" are two
+#    separate requirements, not one — collapsing them into a single "recheck
+#    the deadline, then maybe sleep, then poll" loop means a --timeout at or
+#    below --interval consumes the entire budget in that first capped sleep
+#    and the loop exits before ever making a single request, so even an
+#    instant response is never observed. The fix is to poll once
+#    unconditionally before the deadline-bounded loop even starts, then let
+#    that loop's sleep-then-recheck logic govern every poll after the first.
 
 set -euo pipefail
 
@@ -105,6 +112,37 @@ BASELINE_COMMENT_COUNT="$(echo "$BASELINE_COMMENT_IDS" | jq 'length')"
 echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENT_COUNT, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
 START_TS=$(date +%s)
+
+# Runs one check. Prints the "[Ns] ..." status line and, if either baseline
+# set gained an ID that wasn't there before, the "New activity" summary too.
+# Returns 0 (and has already printed the summary) when new activity was
+# found, 1 otherwise — the caller decides what to do with that.
+poll_once() {
+  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
+  CURRENT_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
+  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")"
+  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")"
+  NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')"
+  NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')"
+
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT"
+
+  if [ "$NEW_REVIEW_COUNT" -gt 0 ] || [ "$NEW_COMMENT_COUNT" -gt 0 ]; then
+    echo
+    echo "New activity on $REPO#$PR:"
+    echo "$NEW_REVIEWS_JSON" | jq -r '.[] | "- review by \(.user.login): \(.state)"'
+    echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
+    return 0
+  fi
+  return 1
+}
+
+# Unconditional first poll, before any deadline math — see gotcha #6. This is
+# the only way a --timeout at or below --interval (or just a fast responder)
+# ever gets observed at all.
+poll_once && exit 0
+
 while :; do
   NOW_TS=$(date +%s)
   REMAINING=$((TIMEOUT - (NOW_TS - START_TS)))
@@ -118,27 +156,11 @@ while :; do
   sleep "$SLEEP_FOR"
 
   NOW_TS=$(date +%s)
-  ELAPSED=$((NOW_TS - START_TS))
-  if [ "$((TIMEOUT - ELAPSED))" -le 0 ]; then
+  if [ "$((TIMEOUT - (NOW_TS - START_TS)))" -le 0 ]; then
     break
   fi
 
-  CURRENT_REVIEWS_JSON="$(api_list "repos/$REPO/pulls/$PR/reviews")"
-  CURRENT_COMMENTS_JSON="$(api_list "repos/$REPO/pulls/$PR/comments")"
-  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")"
-  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")"
-  NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')"
-  NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')"
-
-  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT"
-
-  if [ "$NEW_REVIEW_COUNT" -gt 0 ] || [ "$NEW_COMMENT_COUNT" -gt 0 ]; then
-    echo
-    echo "New activity on $REPO#$PR:"
-    echo "$NEW_REVIEWS_JSON" | jq -r '.[] | "- review by \(.user.login): \(.state)"'
-    echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
-    exit 0
-  fi
+  poll_once && exit 0
 done
 
 echo "Timed out after ${TIMEOUT}s with no new review activity on $REPO#$PR."
