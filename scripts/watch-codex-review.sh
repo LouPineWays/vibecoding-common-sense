@@ -156,6 +156,22 @@
 #     a `--timeout` in the low single digits could expire before a single
 #     real request even finished, independent of the network. Polling every
 #     0.1s instead of every 1s cuts that worst case by 10x.
+#
+# 15. Reviews and inline review comments (`pulls/.../reviews`,
+#     `pulls/.../comments`) only exist when Codex actually has findings to
+#     post. A clean pass — no findings — lands as a plain comment on the
+#     issue-comments timeline instead ("Codex Review: Didn't find any major
+#     issues. Delightful!"), an endpoint this script didn't watch at all
+#     until this gotcha was written — discovered live, by this exact PR
+#     going "all clear" and the watcher still reporting a timeout. Watching
+#     only the first two endpoints means a genuinely clean response is
+#     indistinguishable from Codex never responding. `issues/$PR/comments`
+#     is now a third watched endpoint, baselined the same race-free way as
+#     the other two (captured before the trigger comment is posted) — which
+#     means the trigger comment itself would otherwise look like "new
+#     activity" the moment it's posted. Its own ID, parsed out of `gh pr
+#     comment`'s URL output, is folded into the baseline explicitly so it's
+#     excluded without reintroducing that race.
 
 set -euo pipefail
 
@@ -300,20 +316,49 @@ BASELINE_COMMENTS_JSON="$(api_list "$BASELINE_REMAINING" "repos/$REPO/pulls/$PR/
   || { echo "Error: failed to fetch the baseline review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 BASELINE_COMMENT_IDS="$(echo "$BASELINE_COMMENTS_JSON" | jq '[.[].id]')"
 
+# A PR review is also a formal "review" object (pulls/.../reviews) with
+# inline comments (pulls/.../comments) ONLY when Codex has findings to post.
+# A clean pass — no findings — lands as a plain conversation comment on the
+# issue-comments timeline instead ("Codex Review: Didn't find any major
+# issues. Delightful!"), which neither of the above endpoints will ever
+# surface. Without watching this endpoint too, a genuinely clean response is
+# indistinguishable from Codex never having responded at all, and the
+# watcher times out despite the review having actually happened. See #15.
+BASELINE_REMAINING=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+if [ "$BASELINE_REMAINING" -le 0 ]; then
+  echo "Error: timed out fetching the review-comments baseline before the issue-comments baseline could even start" >&2
+  exit 1
+fi
+BASELINE_ISSUE_COMMENTS_JSON="$(api_list "$BASELINE_REMAINING" "repos/$REPO/issues/$PR/comments")" \
+  || { echo "Error: failed to fetch the baseline issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+BASELINE_ISSUE_COMMENT_IDS="$(echo "$BASELINE_ISSUE_COMMENTS_JSON" | jq '[.[].id]')"
+
 if [ "$TRIGGER" = true ]; then
   TRIGGER_REMAINING=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$TRIGGER_REMAINING" -le 0 ]; then
     echo "Error: timed out before the @codex review trigger comment could be posted" >&2
     exit 1
   fi
-  with_timeout "$TRIGGER_REMAINING" gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null \
+  TRIGGER_OUTPUT="$(with_timeout "$TRIGGER_REMAINING" gh pr comment "$PR" --repo "$REPO" --body "@codex review")" \
     || { echo "Error: failed to post the @codex review trigger comment (network issue, rate limit, or timeout)" >&2; exit 1; }
+  # gh prints the new comment's URL (".../pull/1#issuecomment-<id>") to
+  # stdout. The issue-comments baseline was captured just above, BEFORE this
+  # post, specifically so a fast response can't race past it (see the
+  # reviews/comments baseline comment above) — but that means this trigger
+  # comment itself is not yet in that baseline and would otherwise be
+  # mistaken for Codex's response the moment it appears. Add its own ID to
+  # the baseline explicitly so it's excluded without reintroducing the race.
+  TRIGGER_COMMENT_ID="$(printf '%s' "$TRIGGER_OUTPUT" | grep -oE '[0-9]+$' | tail -1)"
+  if [ -n "$TRIGGER_COMMENT_ID" ]; then
+    BASELINE_ISSUE_COMMENT_IDS="$(echo "$BASELINE_ISSUE_COMMENT_IDS" | jq --argjson id "$TRIGGER_COMMENT_ID" '. + [$id]')"
+  fi
   echo "Posted @codex review on $REPO#$PR"
 fi
 
 BASELINE_REVIEW_COUNT="$(echo "$BASELINE_REVIEW_IDS" | jq 'length')"
 BASELINE_COMMENT_COUNT="$(echo "$BASELINE_COMMENT_IDS" | jq 'length')"
-echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENT_COUNT, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
+BASELINE_ISSUE_COMMENT_COUNT="$(echo "$BASELINE_ISSUE_COMMENT_IDS" | jq 'length')"
+echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comments: $BASELINE_COMMENT_COUNT, issue comments: $BASELINE_ISSUE_COMMENT_COUNT, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 
 # Runs one check. Prints the "[Ns] ..." status line and, if either baseline
 # set gained an ID that wasn't there before, the "New activity" summary too.
@@ -339,21 +384,32 @@ poll_once() {
   CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
     || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  if [ "$remaining" -le 0 ]; then
+    return 1
+  fi
+  CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")" \
+    || { echo "Error: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
+
   NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")" \
     || { echo "Error: failed to compute new reviews" >&2; exit 1; }
   NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")" \
     || { echo "Error: failed to compute new review comments" >&2; exit 1; }
+  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_by_id "$BASELINE_ISSUE_COMMENT_IDS")" \
+    || { echo "Error: failed to compute new issue comments" >&2; exit 1; }
   NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')" || exit 1
   NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')" || exit 1
+  NEW_ISSUE_COMMENT_COUNT="$(echo "$NEW_ISSUE_COMMENTS_JSON" | jq 'length')" || exit 1
 
   ELAPSED=$(( $(date +%s) - START_TS ))
-  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT"
+  echo "  [${ELAPSED}s] new reviews: $NEW_REVIEW_COUNT, new review comments: $NEW_COMMENT_COUNT, new issue comments: $NEW_ISSUE_COMMENT_COUNT"
 
-  if [ "$NEW_REVIEW_COUNT" -gt 0 ] || [ "$NEW_COMMENT_COUNT" -gt 0 ]; then
+  if [ "$NEW_REVIEW_COUNT" -gt 0 ] || [ "$NEW_COMMENT_COUNT" -gt 0 ] || [ "$NEW_ISSUE_COMMENT_COUNT" -gt 0 ]; then
     echo
     echo "New activity on $REPO#$PR:"
     echo "$NEW_REVIEWS_JSON" | jq -r '.[] | "- review by \(.user.login): \(.state)"'
     echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
+    echo "$NEW_ISSUE_COMMENTS_JSON" | jq -r '.[] | "- comment by \(.user.login): " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     return 0
   fi
   return 1
