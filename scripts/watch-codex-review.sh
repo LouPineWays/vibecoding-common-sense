@@ -241,33 +241,66 @@
 #     seconds baseline capture takes, and every real response observed
 #     while building this script took multiple minutes.
 #
-# 21. #19's "just remove the outer recheck" fix didn't actually fix
+# 21. (Superseded by #23 — kept as a record of why the obvious fix didn't
+#     work.) #19's "just remove the outer recheck" fix didn't actually fix
 #     anything — it moved the exact same problem one level deeper.
-#     `poll_once`'s own top-of-function guard checks `remaining <= 0`
-#     before its *first* request, and since `SLEEP_FOR` is capped to
-#     exactly `REMAINING`, waking up from that final sleep always lands on
-#     `remaining` being ~0 — so that guard was *just as guaranteed* to bail
-#     before attempting anything as the outer recheck it replaced. The real
-#     fix has to change what gets slept, not which guard skips the call:
-#     when the capped sleep would run all the way to the deadline, it now
-#     stops `$FINAL_POLL_RESERVE` seconds short instead, so the wake-up
-#     genuinely has a few seconds of positive budget left rather than
-#     exactly zero — enough for a normal, healthy API call to complete.
+#     `poll_once`'s own top-of-function guard checked `remaining <= 0`
+#     before its first request, and since `SLEEP_FOR` was capped to exactly
+#     `REMAINING`, waking up from that final sleep always landed on
+#     `remaining` being ~0 — so that guard was just as guaranteed to bail as
+#     the outer recheck it replaced. Attempted fix: stop the capped sleep
+#     `$FINAL_POLL_RESERVE` seconds short of the deadline instead, so the
+#     wake-up would have a few real seconds of budget left.
 #
-# 22. #21's reserve fixed the "no attempt at all" problem but created a new
-#     one: once `SLEEP_FOR` gets capped (the reserve window), it's clamped
-#     to 0 whenever `REMAINING` is already below `$FINAL_POLL_RESERVE` — and
-#     if `poll_once` returns without finding anything while `REMAINING` is
+# 22. (Superseded by #23.) #21's reserve fixed "no attempt at all" but
+#     created a new failure: once `SLEEP_FOR` was capped, it clamped to 0
+#     whenever `REMAINING` was already below `$FINAL_POLL_RESERVE` — and if
+#     `poll_once` returned without finding anything while `REMAINING` was
 #     *still* barely positive (the reserve wasn't fully used, or the poll
-#     was just fast), the loop goes right back to the top, sees the same
-#     "capped sleep" condition, and does it again — sleep 0, three more
-#     paginated requests, repeat — until `REMAINING` finally ticks down to
-#     zero. A short `--timeout` could burn several rounds of API calls in
-#     its last few seconds instead of the one intended reserved check.
-#     Entering the capped-sleep branch now means this loop iteration IS the
-#     reserved final poll, full stop: it runs once, and the loop always
-#     exits right after — win or lose — rather than looping back to
-#     re-evaluate whether another one is warranted.
+#     was just fast), the loop went right back to the same "capped sleep"
+#     branch and did it again — sleep 0, three more paginated requests,
+#     repeat — until `REMAINING` finally hit zero. Attempted fix: treat
+#     entering the capped-sleep branch as inherently the final iteration and
+#     unconditionally break right after it, win or lose.
+#
+# 23. #22's unconditional break was itself wrong, in the opposite direction:
+#     it gave up the instant the reserved poll finished, even when several
+#     genuine seconds still remained before the real deadline (confirmed
+#     with a mocked `--timeout 6`: it exited around 3.2s, throwing away
+#     ~2.8s of the advertised budget). Three attempts at patching the outer
+#     loop's sleep-capping arithmetic (#19, #21, #22) each fixed one failure
+#     mode and introduced another, because the guarantee ("give the last
+#     moment before the deadline a real, bounded chance, exactly once, no
+#     busy-looping") was never really about *sleeping* — it was about
+#     *poll_once's own willingness to start*. Moved it there instead: a
+#     `GRACE_USED` flag, initialized once before any polling happens.
+#     `poll_once`'s existing `remaining <= 0` guard now spends
+#     `$FINAL_POLL_RESERVE` seconds of grace and sets the flag the *first*
+#     time it would otherwise refuse to start; every time after that, it
+#     refuses for real. The outer loop goes back to the simple form it had
+#     before any of #19/#21/#22 — `SLEEP_FOR = min(INTERVAL, REMAINING)`,
+#     sleep, call `poll_once`, no reserve math, no "is this the final
+#     iteration" bookkeeping — and only stops once `REMAINING <= 0` AND the
+#     grace has already been spent, which naturally sleeps for whatever
+#     real time is left, allows exactly one bounded attempt right at the
+#     boundary, and never repeats it. (Caught testing this fix, not by
+#     Codex: the grace has to extend the *effective* deadline for `poll_once`'s
+#     other two internal checks too, via `grace_bonus`, not just the first —
+#     otherwise those recompute `TIMEOUT - elapsed` fresh, see it's negative
+#     again the instant real time passes `TIMEOUT`, and the grace attempt
+#     dies partway through without ever reaching the code that prints
+#     anything.)
+#
+# 24. `--bot`/`.user.login` filtering (#18) only ever got applied to the
+#     issue-comments check — reviews and inline review comments still used
+#     plain `new_by_id`, unfiltered by author. A different human reviewer,
+#     or an unrelated CI/deploy/coverage bot, submitting a real formal
+#     review or a real inline comment on the same PR while this watches for
+#     one specific bot's response would have been wrongly treated as that
+#     bot answering. `new_by_id` and `new_bot_comments_by_id` are now one
+#     function, `new_by_bot_and_id`, applied identically to all three
+#     watched endpoints — `--bot` now actually scopes everything this script
+#     watches, not just the endpoint the bug happened to be noticed on.
 
 set -euo pipefail
 
@@ -385,21 +418,16 @@ api_list() {
 }
 
 # Reads a JSON array on stdin, returns the elements whose .id isn't present
-# in the JSON array passed as $1.
-new_by_id() {
-  jq --argjson baseline "$1" '[.[] | select(.id as $i | ($baseline | index($i)) == null)]'
-}
-
-# Same as new_by_id, but for the issue-comments endpoint specifically, where
-# any PR participant — not just review bots — can post. Restricted to
-# .user.login == $2 (a specific bot account, not just any bot — a repo can
-# easily have a CI, deploy, or coverage bot also posting on the same PR, and
-# any of those passing "is this Codex" would be as wrong as a human comment
-# passing it) so only the actual requested reviewer's comment counts.
-# Reviews and inline review comments don't need this: submitting a formal
-# review or an inline code comment is inherently review-shaped regardless of
-# who does it, unlike a general-purpose conversation thread.
-new_bot_comments_by_id() {
+# in the JSON array passed as $1 and whose .user.login matches $2. Used for
+# all three watched endpoints (reviews, inline review comments, issue
+# comments). It's tempting to think reviews/inline comments don't need an
+# author filter, since submitting either is inherently review-shaped
+# regardless of who does it — but "review-shaped" isn't the same as "the
+# review being waited for": a different human reviewer, or an unrelated CI/
+# deploy/coverage bot, can submit a real formal review or leave a real
+# inline comment on the same PR while this is watching for one specific
+# bot's response, and none of that should count as Codex having answered.
+new_by_bot_and_id() {
   jq --argjson baseline "$1" --arg bot "$2" '[.[] | select(.user.login == $bot) | select(.id as $i | ($baseline | index($i)) == null)]'
 }
 
@@ -484,34 +512,52 @@ echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comme
 # loop's own deadline check is what turns that into the final timeout
 # message, so this doesn't need to duplicate it).
 poll_once() {
-  local remaining
+  local remaining grace_bonus=0
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
-    return 1
+    # Exactly one grace attempt, ever — see gotcha #23. Without it, a poll
+    # scheduled right at (or the instant after) the deadline never runs at
+    # all. With no cap on how many times it can fire, it's #22's busy-loop
+    # again. GRACE_USED makes it fire exactly once: the first time
+    # poll_once is entered already past budget, spend $FINAL_POLL_RESERVE
+    # seconds attempting anyway; every time after that, give up for real.
+    #
+    # grace_bonus extends the *effective* deadline for the rest of this one
+    # invocation, not just this first check — recomputing "TIMEOUT - elapsed"
+    # for the next two checks below would show <= 0 again the instant real
+    # wall-clock time passes TIMEOUT, silently killing the grace poll after
+    # its first request every time and never reaching the point where this
+    # function actually prints anything.
+    if [ "$GRACE_USED" = true ]; then
+      return 1
+    fi
+    GRACE_USED=true
+    grace_bonus=$FINAL_POLL_RESERVE
+    remaining=$FINAL_POLL_RESERVE
   fi
   CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
     || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
-  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  remaining=$(( TIMEOUT + grace_bonus - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
     return 1
   fi
   CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
     || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
-  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  remaining=$(( TIMEOUT + grace_bonus - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
     return 1
   fi
   CURRENT_ISSUE_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/issues/$PR/comments")" \
     || { echo "Error: failed to fetch issue comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
-  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_id "$BASELINE_REVIEW_IDS")" \
+  NEW_REVIEWS_JSON="$(echo "$CURRENT_REVIEWS_JSON" | new_by_bot_and_id "$BASELINE_REVIEW_IDS" "$BOT_LOGIN")" \
     || { echo "Error: failed to compute new reviews" >&2; exit 1; }
-  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_id "$BASELINE_COMMENT_IDS")" \
+  NEW_COMMENTS_JSON="$(echo "$CURRENT_COMMENTS_JSON" | new_by_bot_and_id "$BASELINE_COMMENT_IDS" "$BOT_LOGIN")" \
     || { echo "Error: failed to compute new review comments" >&2; exit 1; }
-  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_bot_comments_by_id "$BASELINE_ISSUE_COMMENT_IDS" "$BOT_LOGIN")" \
+  NEW_ISSUE_COMMENTS_JSON="$(echo "$CURRENT_ISSUE_COMMENTS_JSON" | new_by_bot_and_id "$BASELINE_ISSUE_COMMENT_IDS" "$BOT_LOGIN")" \
     || { echo "Error: failed to compute new issue comments" >&2; exit 1; }
   NEW_REVIEW_COUNT="$(echo "$NEW_REVIEWS_JSON" | jq 'length')" || exit 1
   NEW_COMMENT_COUNT="$(echo "$NEW_COMMENTS_JSON" | jq 'length')" || exit 1
@@ -531,6 +577,11 @@ poll_once() {
   return 1
 }
 
+# Whether poll_once has already spent its one grace attempt past the
+# deadline (see gotcha #23). Declared here, before the first call, since
+# that mandatory first poll can itself need it on a very short --timeout.
+GRACE_USED=false
+
 # Unconditional first poll, before any deadline math — see gotcha #6. This is
 # the only way a --timeout at or below --interval (or just a fast responder)
 # ever gets observed at all.
@@ -539,40 +590,24 @@ poll_once && exit 0
 while :; do
   NOW_TS=$(date +%s)
   REMAINING=$((TIMEOUT - (NOW_TS - START_TS)))
-  if [ "$REMAINING" -le 0 ]; then
+  # Note: REMAINING <= 0 does NOT break here. It falls through to sleep 0
+  # and call poll_once one more time, because poll_once's own grace logic —
+  # not this loop — is what decides whether that call actually happens. If
+  # GRACE_USED is already true, poll_once returns 1 immediately and the
+  # *next* iteration's REMAINING <= 0 will be caught below instead.
+  if [ "$REMAINING" -le 0 ] && [ "$GRACE_USED" = true ]; then
     break
   fi
   SLEEP_FOR=$INTERVAL
-  FINAL_ITERATION=false
   if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
-    # This sleep would otherwise run all the way to the deadline — stop
-    # $FINAL_POLL_RESERVE seconds short instead, so poll_once wakes up with
-    # real budget left rather than exactly zero. See gotcha #21.
-    SLEEP_FOR=$((REMAINING - FINAL_POLL_RESERVE))
+    SLEEP_FOR=$REMAINING
     if [ "$SLEEP_FOR" -lt 0 ]; then
       SLEEP_FOR=0
     fi
-    FINAL_ITERATION=true
   fi
   sleep "$SLEEP_FOR"
 
-  # No deadline recheck here — see gotcha #19. poll_once already bails
-  # near-instantly on its own if the budget's gone by the time it's called,
-  # so skipping this call when SLEEP_FOR was capped to exactly REMAINING
-  # would only ever throw away the one poll that covers activity arriving
-  # right up to the deadline, for no real savings.
   poll_once && exit 0
-
-  # Once REMAINING was small enough to cap the sleep, this IS the reserved
-  # final poll — stop here rather than looping back. Without this, a small
-  # leftover REMAINING (the reserve wasn't fully consumed, or poll_once
-  # itself was fast) sends the loop right back into the same "SLEEP_FOR
-  # capped to ~0" branch on the next iteration, busy-polling — three more
-  # paginated requests, back to back, with no sleep — for however many
-  # seconds it takes REMAINING to actually tick down to zero. See gotcha #22.
-  if [ "$FINAL_ITERATION" = true ]; then
-    break
-  fi
 done
 
 echo "Timed out after ${TIMEOUT}s with no new review activity on $REPO#$PR."
