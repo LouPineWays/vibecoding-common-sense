@@ -56,16 +56,22 @@ api_list() {
   gh api --paginate --slurp "$1" | jq 'add'
 }
 
-if [ "$TRIGGER" = true ]; then
-  gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null
-  echo "Posted @codex review on $REPO#$PR"
-fi
-
+# Snapshot the current state BEFORE posting the trigger comment, not after.
+# A review bot can respond fast enough that if the trigger goes out first,
+# its review lands with a timestamp older than SINCE and its comments are
+# already folded into the "baseline" — so the poll loop below would never
+# see it as new and the watcher would time out despite a real response.
+#
 # Everything below is compared against this timestamp, not a specific commit
 # SHA, so it also catches reviews that land with no inline comments at all
 # (a plain approval, or a "looks good").
 SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BASELINE_COMMENTS="$(api_list "repos/$REPO/pulls/$PR/comments" | jq 'length')"
+
+if [ "$TRIGGER" = true ]; then
+  gh pr comment "$PR" --repo "$REPO" --body "@codex review" >/dev/null
+  echo "Posted @codex review on $REPO#$PR"
+fi
 
 echo "Watching $REPO#$PR since $SINCE (baseline review comments: $BASELINE_COMMENTS, checking every ${INTERVAL}s, timeout ${TIMEOUT}s)"
 

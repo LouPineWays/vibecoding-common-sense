@@ -30,7 +30,9 @@ exact words.
 1. Copy `CLAUDE.md.template` to `CLAUDE.md` at the root of your repo (and to `AGENTS.md`
    too, if you also run Codex against the same repo).
 2. Copy `.claude/skills/model-check/` and `.claude/skills/humanize/` into your own
-   `.claude/skills/` directory.
+   `.claude/skills/` directory, and `scripts/watch-codex-review.sh` into your own repo (a
+   top-level `scripts/` directory works, or wherever you keep repo tooling) — the copied
+   `CLAUDE.md` references it by that relative path.
 3. Read through what you copied and delete anything that doesn't apply. The file-safety
    section in particular has a placeholder for *your* no-touch data — fill it in with the
    real thing, don't leave it generic.
