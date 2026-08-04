@@ -107,6 +107,44 @@ your own repeated corrections are — naming conventions, a banned pattern, a re
 before a certain kind of change — write them here the same way, as a rule with a reason,
 not just a reminder.
 
+## When one spot keeps needing fixes, stop and diagnose before patch three
+
+If you've edited the same function or file more than twice for what looks like a new bug
+each time, stop before writing the next patch and ask: is this actually several unrelated
+bugs, or one fragile design producing a new symptom every round? A patch verified only
+against the one scenario that was just reported doesn't test the *shape* of the problem —
+it silently leaves the design just as capable of producing the next symptom, so the fix
+count climbs while the underlying bug count doesn't actually drop. Each individual patch
+can be completely correct and the loop still never converges, because "correct for the
+reported case" and "correct in general" are different claims.
+
+This exact loop happened building the review-watcher script in this pack
+(`scripts/watch-codex-review.sh`): getting "poll for a bot's response within a timeout,
+without polling forever or missing the answer" right took roughly twenty rounds of
+automated review before anyone stopped to name what was actually happening. Most of those
+rounds were narrow, verified, genuinely-correct fixes to the *one case just reported* —
+and nearly all of them were the same underlying defect wearing a new trigger: a function
+that discarded already-successful partial work the moment any one step inside it failed,
+whether that step failed from a budget check, a timeout, or a real error. Patch after patch
+closed the specific trigger without ever asking "what's the general version of this
+failure?" The loop only ended once someone stepped back and asked that question directly,
+then made failure non-fatal to already-completed work as a structural rule, instead of
+special-casing the next way a step could fail.
+
+Two things to actually do differently once you notice you're in this loop:
+
+- **Name the general shape before writing the next patch.** If patch two and patch three
+  are both edits to the same dozen lines for "another edge case," write down — in a
+  sentence, doesn't need to be formal — what class of failure they're both instances of.
+  Often the honest answer is "this can't be made narrowly correct, it needs restructuring,"
+  and that's worth knowing before patch four.
+- **If verifying each patch costs real external time** (a slow bot review, a live API call,
+  a human in the loop) and you've paid that cost more than twice on the same problem, stop
+  paying it per-iteration. Build a fast local repro — a mock, a stub, a fake input that
+  triggers the same code path — so the next several attempts cost seconds instead of
+  minutes each. Still paying the external round-trip tax for iteration five is itself a
+  sign you're testing symptoms, not the actual fix.
+
 ## Multi-agent collaboration
 
 If you use more than one AI coding tool against this repo (Claude Code, Codex, others),
