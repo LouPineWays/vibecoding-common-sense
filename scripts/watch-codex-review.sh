@@ -241,18 +241,18 @@
 #     seconds baseline capture takes, and every real response observed
 #     while building this script took multiple minutes.
 #
-# 21. (Superseded by #23 — kept as a record of why the obvious fix didn't
-#     work.) #19's "just remove the outer recheck" fix didn't actually fix
-#     anything — it moved the exact same problem one level deeper.
-#     `poll_once`'s own top-of-function guard checked `remaining <= 0`
-#     before its first request, and since `SLEEP_FOR` was capped to exactly
-#     `REMAINING`, waking up from that final sleep always landed on
-#     `remaining` being ~0 — so that guard was just as guaranteed to bail as
-#     the outer recheck it replaced. Attempted fix: stop the capped sleep
-#     `$FINAL_POLL_RESERVE` seconds short of the deadline instead, so the
-#     wake-up would have a few real seconds of budget left.
+# 21. (Superseded by #25 — kept as a record of the reasoning trail.) #19's
+#     "just remove the outer recheck" fix didn't actually fix anything — it
+#     moved the exact same problem one level deeper. `poll_once`'s own
+#     top-of-function guard checked `remaining <= 0` before its first
+#     request, and since `SLEEP_FOR` was capped to exactly `REMAINING`,
+#     waking up from that final sleep always landed on `remaining` being ~0
+#     — so that guard was just as guaranteed to bail as the outer recheck
+#     it replaced. Attempted fix: stop the capped sleep `$FINAL_POLL_RESERVE`
+#     seconds short of the deadline instead, so the wake-up would have a
+#     few real seconds of budget left.
 #
-# 22. (Superseded by #23.) #21's reserve fixed "no attempt at all" but
+# 22. (Superseded by #25.) #21's reserve fixed "no attempt at all" but
 #     created a new failure: once `SLEEP_FOR` was capped, it clamped to 0
 #     whenever `REMAINING` was already below `$FINAL_POLL_RESERVE` — and if
 #     `poll_once` returned without finding anything while `REMAINING` was
@@ -263,33 +263,15 @@
 #     entering the capped-sleep branch as inherently the final iteration and
 #     unconditionally break right after it, win or lose.
 #
-# 23. #22's unconditional break was itself wrong, in the opposite direction:
-#     it gave up the instant the reserved poll finished, even when several
-#     genuine seconds still remained before the real deadline (confirmed
-#     with a mocked `--timeout 6`: it exited around 3.2s, throwing away
-#     ~2.8s of the advertised budget). Three attempts at patching the outer
-#     loop's sleep-capping arithmetic (#19, #21, #22) each fixed one failure
-#     mode and introduced another, because the guarantee ("give the last
-#     moment before the deadline a real, bounded chance, exactly once, no
-#     busy-looping") was never really about *sleeping* — it was about
-#     *poll_once's own willingness to start*. Moved it there instead: a
-#     `GRACE_USED` flag, initialized once before any polling happens.
-#     `poll_once`'s existing `remaining <= 0` guard now spends
-#     `$FINAL_POLL_RESERVE` seconds of grace and sets the flag the *first*
-#     time it would otherwise refuse to start; every time after that, it
-#     refuses for real. The outer loop goes back to the simple form it had
-#     before any of #19/#21/#22 — `SLEEP_FOR = min(INTERVAL, REMAINING)`,
-#     sleep, call `poll_once`, no reserve math, no "is this the final
-#     iteration" bookkeeping — and only stops once `REMAINING <= 0` AND the
-#     grace has already been spent, which naturally sleeps for whatever
-#     real time is left, allows exactly one bounded attempt right at the
-#     boundary, and never repeats it. (Caught testing this fix, not by
-#     Codex: the grace has to extend the *effective* deadline for `poll_once`'s
-#     other two internal checks too, via `grace_bonus`, not just the first —
-#     otherwise those recompute `TIMEOUT - elapsed` fresh, see it's negative
-#     again the instant real time passes `TIMEOUT`, and the grace attempt
-#     dies partway through without ever reaching the code that prints
-#     anything.)
+# 23. (Superseded by #25.) #22's unconditional break was itself wrong, in
+#     the opposite direction: it gave up the instant the reserved poll
+#     finished, even when several genuine seconds still remained before the
+#     real deadline (confirmed with a mocked `--timeout 6`: it exited around
+#     3.2s, throwing away ~2.8s of the advertised budget). Attempted fix:
+#     move the guarantee into `poll_once` itself via a one-shot `GRACE_USED`
+#     flag, spending `$FINAL_POLL_RESERVE` seconds *past* `TIMEOUT` for
+#     exactly one attempt — which worked for that scenario, but had a
+#     problem of its own: see #25.
 #
 # 24. `--bot`/`.user.login` filtering (#18) only ever got applied to the
 #     issue-comments check — reviews and inline review comments still used
@@ -301,6 +283,39 @@
 #     function, `new_by_bot_and_id`, applied identically to all three
 #     watched endpoints — `--bot` now actually scopes everything this script
 #     watches, not just the endpoint the bug happened to be noticed on.
+#
+# 25. #23's grace flag fixed the "give the boundary a real chance" problem
+#     but broke a different, more important guarantee: "never exceed
+#     --timeout." Spending `$FINAL_POLL_RESERVE` seconds *past* `TIMEOUT`
+#     means the watcher can both run measurably longer than what was asked
+#     for, and — the sharper issue — report success for activity that, as
+#     far as this script can actually prove, arrived *after* the deadline.
+#     ID-based detection (gotcha #3/#4) has no `created_at` to check that
+#     against without reintroducing the exact timestamp race those gotchas
+#     moved away from, so there's no honest way to tell "arrived just
+#     before the deadline" from "arrived just after, during the borrowed
+#     grace" once grace exists at all. The fix removes borrowing entirely:
+#     `poll_once`'s guard is back to a plain, unconditional `remaining <= 0`
+#     → refuse, exactly like before any of #19/#21/#22/#23 touched it. The
+#     "give the boundary a real chance" half of the problem is solved in
+#     the outer loop instead, the same way #21 first tried — reserve
+#     `$FINAL_POLL_RESERVE` seconds *of the original, unborrowed budget* by
+#     stopping the capped sleep that much short — but *without* #22's
+#     "treat this as the final iteration, break unconditionally" rule. The
+#     ordinary `REMAINING <= 0` check is what ends the loop, same as always;
+#     nothing about it needs to know this was a "final" iteration. Any
+#     extra iterations in the last stretch, once `REMAINING` has shrunk
+#     below the reserve, are cheap — `poll_once`'s unconditional guard
+#     refuses instantly, with no network calls, so there's no repeated round
+#     of real requests left to waste, just a few near-zero-cost checks
+#     before `REMAINING` finally reads at or below zero and the loop exits.
+#     Net effect versus #23: strictly bounded within `TIMEOUT` again (the
+#     property that actually matters), at the cost of a narrow edge case
+#     #23 covered and this doesn't — activity landing in the sliver of time
+#     between the last real check and the deadline can still be missed. That
+#     trade was judged correct: silently reporting success past a stated
+#     deadline is a worse failure mode than occasionally, honestly, timing
+#     out despite a response that arrived in the final instant.
 
 set -euo pipefail
 
@@ -512,41 +527,32 @@ echo "Watching $REPO#$PR (baseline reviews: $BASELINE_REVIEW_COUNT, review comme
 # loop's own deadline check is what turns that into the final timeout
 # message, so this doesn't need to duplicate it).
 poll_once() {
-  local remaining grace_bonus=0
+  local remaining
 
+  # No grace, no borrowed time — a call that starts with remaining <= 0
+  # simply refuses, every time. See gotcha #25 for why: an earlier design
+  # (gotcha #23) let this guard spend a few seconds of "grace" past TIMEOUT
+  # for exactly one attempt, which meant the watcher could both run past
+  # the advertised deadline AND report success for activity that, for all
+  # this script can prove, actually arrived after it. Getting the final
+  # moment before the deadline a genuine chance is the outer loop's job now
+  # (leaving real, unborrowed budget for this call to spend — see the sleep
+  # reservation below), not this guard's.
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
-    # Exactly one grace attempt, ever — see gotcha #23. Without it, a poll
-    # scheduled right at (or the instant after) the deadline never runs at
-    # all. With no cap on how many times it can fire, it's #22's busy-loop
-    # again. GRACE_USED makes it fire exactly once: the first time
-    # poll_once is entered already past budget, spend $FINAL_POLL_RESERVE
-    # seconds attempting anyway; every time after that, give up for real.
-    #
-    # grace_bonus extends the *effective* deadline for the rest of this one
-    # invocation, not just this first check — recomputing "TIMEOUT - elapsed"
-    # for the next two checks below would show <= 0 again the instant real
-    # wall-clock time passes TIMEOUT, silently killing the grace poll after
-    # its first request every time and never reaching the point where this
-    # function actually prints anything.
-    if [ "$GRACE_USED" = true ]; then
-      return 1
-    fi
-    GRACE_USED=true
-    grace_bonus=$FINAL_POLL_RESERVE
-    remaining=$FINAL_POLL_RESERVE
+    return 1
   fi
   CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
     || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
-  remaining=$(( TIMEOUT + grace_bonus - ( $(date +%s) - START_TS ) ))
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
     return 1
   fi
   CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
     || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
-  remaining=$(( TIMEOUT + grace_bonus - ( $(date +%s) - START_TS ) ))
+  remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -le 0 ]; then
     return 1
   fi
@@ -577,11 +583,6 @@ poll_once() {
   return 1
 }
 
-# Whether poll_once has already spent its one grace attempt past the
-# deadline (see gotcha #23). Declared here, before the first call, since
-# that mandatory first poll can itself need it on a very short --timeout.
-GRACE_USED=false
-
 # Unconditional first poll, before any deadline math — see gotcha #6. This is
 # the only way a --timeout at or below --interval (or just a fast responder)
 # ever gets observed at all.
@@ -590,23 +591,32 @@ poll_once && exit 0
 while :; do
   NOW_TS=$(date +%s)
   REMAINING=$((TIMEOUT - (NOW_TS - START_TS)))
-  # Note: REMAINING <= 0 does NOT break here. It falls through to sleep 0
-  # and call poll_once one more time, because poll_once's own grace logic —
-  # not this loop — is what decides whether that call actually happens. If
-  # GRACE_USED is already true, poll_once returns 1 immediately and the
-  # *next* iteration's REMAINING <= 0 will be caught below instead.
-  if [ "$REMAINING" -le 0 ] && [ "$GRACE_USED" = true ]; then
+  if [ "$REMAINING" -le 0 ]; then
     break
   fi
   SLEEP_FOR=$INTERVAL
   if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
-    SLEEP_FOR=$REMAINING
+    # Leave $FINAL_POLL_RESERVE seconds of the ORIGINAL remaining budget
+    # unslept, rather than sleeping all the way to the deadline — so the
+    # poll below starts with genuine, unborrowed time still on the clock.
+    # See gotcha #25: this reserve lives entirely within TIMEOUT, unlike
+    # the grace-based attempt it replaces, which extended past it instead.
+    SLEEP_FOR=$((REMAINING - FINAL_POLL_RESERVE))
     if [ "$SLEEP_FOR" -lt 0 ]; then
       SLEEP_FOR=0
     fi
   fi
   sleep "$SLEEP_FOR"
 
+  # Deliberately no "was this the final iteration, so stop now" bookkeeping
+  # (gotcha #22 had that, and it discarded real leftover budget). The
+  # ordinary REMAINING <= 0 check at the top of the next iteration is what
+  # ends this loop. Any extra iterations in the last stretch, once
+  # REMAINING has shrunk below $FINAL_POLL_RESERVE, are cheap: poll_once's
+  # own unconditional "remaining <= 0 → return 1" guard refuses instantly,
+  # with no network calls, so there's no repeated round of real requests
+  # left to waste — just a few near-zero-cost iterations before the top
+  # check finally sees REMAINING at or below zero and breaks for good.
   poll_once && exit 0
 done
 
