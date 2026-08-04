@@ -109,6 +109,18 @@ run_case "single-endpoint-persistent-failure-exits-loudly" 1 "reviews.*failed.*t
   FAKE_GH_COMMENTS_SEQUENCE=1,2 \
   FAKE_GH_ISSUE_COMMENTS_SEQUENCE=1,2
 
+# Reviews reaches its failure threshold on call 4 -- the exact same call
+# where issue comments (healthy the whole time) shows a genuinely new id.
+# Reviews is fetched first each round, so the old inline-exit behavior
+# would abort before issue comments was ever fetched that round, losing a
+# finding that was one fetch away. Should still report the real activity
+# (exit 0), not die on the persistent-failure error.
+EXTRA_ARGS=(--interval 1 --timeout 30)
+run_case "finding-survives-concurrent-persistent-failure" 0 "comment by chatgpt-codex-connector" -- \
+  FAKE_GH_REVIEWS_MODE_SEQUENCE="success;error;error;error" \
+  FAKE_GH_COMMENTS_SEQUENCE=1,2 \
+  FAKE_GH_ISSUE_COMMENTS_SEQUENCE="1,2;1,2;1,2;1,2,3"
+
 EXTRA_ARGS=(--interval 20 --timeout 3)
 run_case "very-tight-timeout-still-attempts-and-stays-bounded" 1 "Timed out after 3s" -- \
   FAKE_GH_REVIEWS_SEQUENCE=1,2

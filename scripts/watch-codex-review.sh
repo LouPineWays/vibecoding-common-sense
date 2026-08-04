@@ -372,6 +372,29 @@
 #     own — after `$MAX_ENDPOINT_FAILURES` consecutive failures on that one
 #     endpoint, regardless of how the other two are doing, naming which
 #     endpoint is degraded so the message is actually actionable.
+#
+# 30. Two problems, same round of review, both worth recording. First: #29
+#     put `exit 1` right where each endpoint's threshold check lived —
+#     which reintroduces the *exact* bug #26/#28 already fixed once, just
+#     from a new direction. An endpoint hitting its failure threshold would
+#     abort immediately, before the other two endpoints were even fetched
+#     this call, discarding whatever an earlier fetch in the very same call
+#     had already found, or skipping a still-healthy endpoint's check
+#     entirely — e.g. reviews finally trips its threshold right as Codex
+#     posts a clean-pass issue comment, and the watcher dies on an API
+#     error instead of reporting the response it could have observed one
+#     fetch later. Fixed by *not* exiting inline: a hit threshold is
+#     recorded in `PERSISTENT_FAILURE_MESSAGE`, the function keeps going
+#     and evaluates whatever it fetched, reports real activity if there is
+#     any (a broken endpoint stops mattering the moment a healthy one finds
+#     the actual answer), and only exits on the recorded message at the
+#     very end, once nothing was found. Second, unrelated but caught in the
+#     same pass: the sleep-reservation branch used `[ "$SLEEP_FOR" -gt
+#     "$REMAINING" ]` — strict greater-than — so the exact-equality case
+#     (`SLEEP_FOR == REMAINING`) skipped the reserve branch entirely and
+#     slept away the whole remaining budget with none held back, landing
+#     right back on gotcha #25's original problem at that one specific
+#     boundary. Changed to `-ge`.
 
 set -euo pipefail
 
@@ -621,7 +644,21 @@ poll_once() {
   # watcher would run out the full --timeout and report an ordinary,
   # misleadingly unremarkable "no new activity" instead of "reviews
   # couldn't be checked the whole time." Each endpoint gets its own streak
-  # and can independently trigger the loud exit.
+  # and can independently flag a persistent failure.
+  #
+  # None of the three blocks below exits immediately on hitting its
+  # threshold — see gotcha #30. Exiting inline reintroduces the exact bug
+  # #26/#28 already fixed: an endpoint hitting its failure threshold would
+  # abort before the OTHER two endpoints were even fetched, discarding
+  # whatever an earlier fetch in this same call had already found, or
+  # skipping a still-healthy endpoint's check entirely. A hit threshold is
+  # recorded in PERSISTENT_FAILURE_MESSAGE instead; the function finishes
+  # evaluating whatever it fetched, reports real activity if there is any
+  # (a persistently broken endpoint stops mattering the moment a healthy
+  # one finds the actual response), and only exits on the recorded message
+  # at the very end, once nothing was found.
+  PERSISTENT_FAILURE_MESSAGE=""
+
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
   if [ "$remaining" -gt 0 ]; then
     if CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")"; then
@@ -631,8 +668,7 @@ poll_once() {
       REVIEWS_FAILURE_STREAK=$((REVIEWS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch reviews from the GitHub API ($REVIEWS_FAILURE_STREAK in a row)" >&2
       if [ "$REVIEWS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        echo "Error: fetching reviews has failed $REVIEWS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real review response could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
-        exit 1
+        PERSISTENT_FAILURE_MESSAGE="fetching reviews has failed $REVIEWS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real review response could be sitting there unobserved"
       fi
     fi
   fi
@@ -646,8 +682,7 @@ poll_once() {
       COMMENTS_FAILURE_STREAK=$((COMMENTS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch review comments from the GitHub API ($COMMENTS_FAILURE_STREAK in a row)" >&2
       if [ "$COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        echo "Error: fetching review comments has failed $COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real inline comment could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
-        exit 1
+        PERSISTENT_FAILURE_MESSAGE="fetching review comments has failed $COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real inline comment could be sitting there unobserved"
       fi
     fi
   fi
@@ -661,8 +696,7 @@ poll_once() {
       ISSUE_COMMENTS_FAILURE_STREAK=$((ISSUE_COMMENTS_FAILURE_STREAK + 1))
       echo "Warning: failed to fetch issue comments from the GitHub API ($ISSUE_COMMENTS_FAILURE_STREAK in a row)" >&2
       if [ "$ISSUE_COMMENTS_FAILURE_STREAK" -ge "$MAX_ENDPOINT_FAILURES" ]; then
-        echo "Error: fetching issue comments has failed $ISSUE_COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real clean-pass response could be sitting there unobserved. Giving up rather than silently reporting a possibly-misleading timeout." >&2
-        exit 1
+        PERSISTENT_FAILURE_MESSAGE="fetching issue comments has failed $ISSUE_COMMENTS_FAILURE_STREAK times in a row — this endpoint looks persistently broken (auth, rate limit, network), and a real clean-pass response could be sitting there unobserved"
       fi
     fi
   fi
@@ -687,6 +721,16 @@ poll_once() {
     echo "$NEW_COMMENTS_JSON" | jq -r '.[] | "- \(.path):\(.line // "?") — " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     echo "$NEW_ISSUE_COMMENTS_JSON" | jq -r '.[] | "- comment by \(.user.login): " + (.body | gsub("<[^>]+>"; "") | gsub("\n\n"; " "))'
     return 0
+  fi
+
+  # Only checked here, after everything fetched this round has already
+  # been evaluated for real activity — see gotcha #30. If something was
+  # actually found above, this function already returned 0 and none of the
+  # following runs; a persistently broken endpoint stops being worth
+  # ending the watch over the moment a still-healthy one finds the answer.
+  if [ -n "$PERSISTENT_FAILURE_MESSAGE" ]; then
+    echo "Error: $PERSISTENT_FAILURE_MESSAGE. Giving up rather than silently reporting a possibly-misleading timeout." >&2
+    exit 1
   fi
   return 1
 }
@@ -718,7 +762,13 @@ while :; do
     break
   fi
   SLEEP_FOR=$INTERVAL
-  if [ "$SLEEP_FOR" -gt "$REMAINING" ]; then
+  # -ge, not -gt: when SLEEP_FOR exactly equals REMAINING, sleeping the
+  # full amount is just as much "sleep away the entire budget" as sleeping
+  # more than it — the strict > let that exact-equality case skip the
+  # reserve branch entirely, landing right back on poll_once waking up
+  # with zero budget, gotcha #25's original problem, at that one specific
+  # boundary. See gotcha #30.
+  if [ "$SLEEP_FOR" -ge "$REMAINING" ]; then
     if [ "$RESERVE_USED" = true ]; then
       # Already spent the one reserved attempt (below) on an earlier
       # iteration. Sleep out whatever's left instead of reserving again —
