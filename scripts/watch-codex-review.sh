@@ -76,12 +76,30 @@
 #    that stalls (or a slow/rate-limited response) can still block past
 #    `--timeout` on its own, however tight the sleep/deadline logic around it
 #    is. `with_timeout` below bounds each request to whatever's left of the
-#    budget. It's hand-rolled with a background process and `kill` rather
-#    than calling the `timeout` command, because `timeout` isn't part of a
-#    stock macOS install (only Linux and Git-for-Windows ship it by
-#    default) — depending on it would silently break for a chunk of users
-#    the first time a request actually hangs, which is exactly when you'd
-#    want this to work.
+#    budget, by polling `kill -0` on the backgrounded command once a second
+#    rather than calling the `timeout` command — `timeout` isn't part of a
+#    stock macOS install (only Linux and Git-for-Windows ship it by default),
+#    so depending on it would silently break for a chunk of users the first
+#    time a request actually hangs, which is exactly when it matters. A
+#    background-`sleep`-plus-`kill` watchdog was the first attempt at this,
+#    but killing the watchdog process once the real command finishes doesn't
+#    kill the `sleep` it's blocked on — Unix reparents that child instead of
+#    ending it, so it lingers for its full original duration every time,
+#    piling up one straggler per poll. `bash 4.3+`'s `wait -n` can wait on
+#    either of two backgrounded jobs and would avoid that, but stock macOS
+#    ships bash 3.2 (GPL licensing), which doesn't have it — so this polls
+#    instead of blocking on anything backgrounded, and never creates a
+#    process it has to remember to separately clean up.
+#
+# 9. `remaining` can reach zero or go negative mid-`poll_once` — e.g. the
+#    reviews request used almost the whole budget, so the comments request
+#    recomputes a `remaining` of 0 right before it starts. Passed straight
+#    through, that collides with `with_timeout`'s own "`<= 0` means
+#    unbounded" sentinel (intentional for the one-time baseline calls, which
+#    pass a literal `0`), so the comments request would run with no bound at
+#    all — the opposite of what an exhausted deadline should mean. Every
+#    `remaining` computed inside `poll_once` is clamped to at least 1 before
+#    it's passed on, so it's always a real bound during actual polling.
 
 set -euo pipefail
 
@@ -116,12 +134,20 @@ with_timeout() {
   out="$(mktemp)"
   "$@" >"$out" 2>&1 &
   local pid=$!
-  ( sleep "$secs" 2>/dev/null; kill -TERM "$pid" 2>/dev/null ) &
-  local watcher=$!
-  local status=0
-  wait "$pid" 2>/dev/null || status=$?
-  kill "$watcher" 2>/dev/null
-  wait "$watcher" 2>/dev/null
+  local waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      cat "$out"
+      rm -f "$out"
+      return 124
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+  local status=$?
   cat "$out"
   rm -f "$out"
   return "$status"
@@ -174,10 +200,12 @@ poll_once() {
   local remaining
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  [ "$remaining" -lt 1 ] && remaining=1
   CURRENT_REVIEWS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/reviews")" \
     || { echo "Error: failed to fetch reviews from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
   remaining=$(( TIMEOUT - ( $(date +%s) - START_TS ) ))
+  [ "$remaining" -lt 1 ] && remaining=1
   CURRENT_COMMENTS_JSON="$(api_list "$remaining" "repos/$REPO/pulls/$PR/comments")" \
     || { echo "Error: failed to fetch review comments from the GitHub API (network issue, rate limit, or timeout)" >&2; exit 1; }
 
