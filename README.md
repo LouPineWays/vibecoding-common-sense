@@ -118,3 +118,10 @@ MIT — see [`LICENSE`](LICENSE). Use it, fork it, strip your own project's name
 only requires keeping the copyright and permission notice in the `LICENSE` file itself when
 you redistribute a substantial portion of this repo — beyond that, no separate credit or
 backlink is required (though one's always appreciated).
+
+**One exception, and it isn't mine to waive.** `.claude/skills/skill-observer/` is adapted
+from [task-observer](https://github.com/rebelytics/one-skill-to-rule-them-all) by Eoghan Henn
+/ rebelytics.com, which is licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/),
+not MIT. That license does require credit. If you redistribute that skill, keep the
+attribution paragraph at the top of its `SKILL.md`; everything else in this repo is MIT as
+described above.
