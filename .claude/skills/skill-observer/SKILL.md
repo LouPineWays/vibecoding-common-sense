@@ -16,8 +16,9 @@ when a skill's own instructions were wrong, and write it down. If your setup gro
 many skills under heavy concurrent use, the full task-observer is worth adopting instead —
 this isn't a replacement for it, just a lighter on-ramp for everyone else.
 
-Adapted under CC BY 4.0: credit to Eoghan Henn / rebelytics.com and the original repo
-linked above. If you redistribute this file, keep this attribution.
+Adapted under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/): credit to Eoghan
+Henn / rebelytics.com and the original repo linked above. If you redistribute this file,
+keep this attribution.
 
 **Scope boundary:** this skill is for defects in a *skill file's own instructions* —
 something `.claude/skills/<name>/SKILL.md` tells the agent to do that turned out wrong,

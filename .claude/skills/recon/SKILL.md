@@ -31,6 +31,16 @@ Two genuinely different things get called "copy this skill to another repo":
   purpose and are not meant to be forced back into sync. Registering an adapted port in the
   parity manifest would make CI fail forever on a difference that's supposed to exist.
 
+**One part of an adapted port must still match across copies: upstream attribution.** If the
+ported idea came from someone else's licensed work, the credit block — author, license, a link
+to the license text, and the indication that you changed it — reads the same everywhere,
+because that's a license term rather than a house-style choice. `skill-observer` is again the
+example: all three copies carry the same CC BY 4.0 paragraph crediting `task-observer`, even
+though the prose around it is deliberately different per repo. Nothing enforces this, since an
+adapted port is out of the parity manifest by definition, so when you touch one copy's
+attribution, update the others in the same pass. Word_Burner's and Covenant's drifted until
+2026-08-06 (a bare link naming neither author nor license) and only a manual read caught it.
+
 If it's not obvious which one the user means, ask. Don't guess and don't default to
 parity-tracking just because copying is involved.
 
