@@ -1,6 +1,6 @@
 ---
 name: model-check
-description: Recommends which model — a local model, Codex, or Claude Haiku / Sonnet / Opus — and, for Sonnet and Opus, which effort tier fits the task you're about to do, so you don't default to a high-effort model for simple work. Use this whenever you run /model-check, ask "what model should I use", "is this overkill for Sonnet High", "do I need Opus for this", "is this a Haiku task", "should Codex handle this", "should I offload this locally", "should I use high effort", or similar meta-questions about model/effort/agent selection at the start of a conversation or when the shape of the task changes mid-conversation. Advisory only — produces a recommendation, does not switch models itself.
+description: Recommends which model — a local model, Codex, or Claude Haiku / Sonnet / Opus — and, for Sonnet and Opus, which effort tier fits the task you're about to do, so you don't default to a high-effort model for simple work. Also decides when a task should be split across an orchestrator and cheaper worker subagents rather than run on one model. Use this whenever you run /model-check, ask "what model should I use", "is this overkill for Sonnet High", "do I need Opus for this", "is this a Haiku task", "should Codex handle this", "should I offload this locally", "should I use high effort", "should I split this into subagents", "would an orchestrator help here", or similar meta-questions about model/effort/agent selection at the start of a conversation or when the shape of the task changes mid-conversation. Advisory only — produces a recommendation, does not switch models itself.
 ---
 
 # Model Check
@@ -73,10 +73,60 @@ an active session on the same repo, it should use a separate worktree or clone, 
 separate branch — a shared working directory can only have one branch checked out at a
 time, so two concurrent processes in it can still overwrite each other's files.
 
+**The reason to reach for a second agent is often the budget, not just the task type.** If
+it bills against a separate account or subscription rather than sharing your primary tool's
+quota, it's also your quota-relief valve — worth weighting up whenever you're actually
+constrained by a shared rate limit (a long unattended run, several tasks queued at once),
+even for work that would otherwise sit comfortably with your primary tool. Two costs come
+with using it that way, both worth checking rather than assuming: a task finished on the
+second tool doesn't necessarily land back in your repo on its own — check whether it needs
+a manual publish, merge, or push step before you treat it as shipped — and the task's own
+summary of what it did is never itself evidence; verify against the actual commit, PR, or
+file it claims to have touched before trusting it.
+
 Check this fit *before* running the model/effort scoring below — if the task is clearly a
 second-agent-shaped task, say so up front. This doesn't replace the primary-model
 recommendation (something still has to review the second agent's output, or it may not be
 the chosen path this time), so still run the scoring and give both.
+
+## Orchestrator + worker subagents (a shape, not a rung either)
+
+Sometimes the right answer isn't one model at all: a stronger model plans and reviews while
+cheaper workers handle the bulk. If your tool can spawn sub-agents with a model override
+(Claude Code's `Agent` tool works this way), a session can farm sub-tasks out to a cheaper
+tier with no setup, no credential, and no extra infrastructure. It works from anywhere the
+primary session runs, including a phone-driven cloud session.
+
+**Recommend it only when the sub-tasks are genuinely independent**, because every spawned
+agent starts cold and re-derives context the orchestrator already has. Several subagents on
+several slices of *one* problem — where each slice needs the whole picture first — costs
+*more* than doing it in one session. Several subagents searching unrelated areas, or
+drafting several independent things from self-contained briefs, amortizes that cost
+properly. Good fits: parallel search across separate parts of a repo, several independent
+files getting the same mechanical treatment, a batch of self-contained drafts. Poor fits:
+anything where step two depends on step one's answer, or where the orchestrator would have
+to paste most of its own context into every worker anyway.
+
+Frame it honestly as **parallelism with a modest token discount, not quota relief** —
+subagents spawned this way typically draw on the same account or quota as the parent
+session. When the actual constraint is a shared rate limit rather than wall-clock time, a
+second coding agent billing against its own separate account (see above) is the answer, not
+a subagent fan-out.
+
+**Be wary of proposing an external worker model reached by a bare API call** (a third-party
+hosted model, called directly from inside an agent session, as a cheap stand-in for a
+subagent or a second coding agent). The failure mode usually isn't the model or its price —
+it's that agent cloud/sandboxed environments typically have no real secrets store. An API
+key pasted into a session or set as an environment variable sits in plaintext somewhere the
+platform's own docs will tell you not to put credentials. On top of that, a worker reached
+by a bare API call has no repo access, no tools, and no way to check its own output against
+the codebase; you still pay the orchestration cost of assembling its prompt and reviewing
+what comes back, so for anything but a large batch, that round trip is often comparable to
+just doing the task yourself. The one real exception is a CI system with its own encrypted
+secrets store (GitHub Actions and similar) — worth considering only when a task is
+genuinely bulk, mechanical, and verifiable by a deterministic script without human
+judgment. If nothing in your own backlog currently has that shape, treat this as a door
+left open rather than a live option, and don't build it speculatively.
 
 ## What to evaluate
 
@@ -156,6 +206,8 @@ Keep it to a few lines. Don't pad it.
 
 ```
 [**Second-agent fit: [why, one line]** — omit entirely if the task isn't shaped for one]
+[**Delegation fit: [why, one line]** — omit unless the task splits into genuinely
+independent sub-tasks; name the orchestrator tier and the worker tier]
 **Recommendation: [Model]**[, [Effort] effort — omit for tiers with no dial]
 Why: [one line naming the axes that actually drove each stage — not generic filler]
 (Advisory only — I can't switch mid-session. Pick this next time you start/continue a
