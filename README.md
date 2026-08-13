@@ -26,6 +26,7 @@ exact words.
 | [`.claude/skills/skill-observer/`](.claude/skills/skill-observer/SKILL.md) | A skill that logs it when one of your other skills gives wrong or stale instructions, so fixes accumulate in a plain file instead of getting lost. A small-repo alternative to [task-observer](https://github.com/rebelytics/one-skill-to-rule-them-all) (Eoghan Henn / rebelytics.com, CC BY 4.0) — same core idea, without the concurrency machinery a large skill library under heavy parallel use needs. |
 | [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
 | [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) | Five checks to run before requesting review, so common review-round-inflating mistakes get caught before an external reviewer sees the diff instead of after. |
+| [`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) | The same idea for a design or architecture doc instead of code — a doc has no compiler to converge against, so three of the five checks are doc-specific and there's an added round-cap rule. |
 
 ## Quickstart
 
