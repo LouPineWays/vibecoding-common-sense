@@ -188,3 +188,10 @@ before the first review request goes out, that catch the same failure modes befo
 reviewer ever sees the diff instead of after round two or three. See
 [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) — especially before re-requesting
 review on a function you've already touched once for a finding.
+
+**For a design or architecture doc instead of code, use
+[`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) instead.** Same idea, but a doc has
+no compiler or test suite to converge against, so three of the five checks needed a doc-specific
+replacement (a rubric to check the draft against, a self-review pass) plus an added round-cap
+rule, since without a compiler forcing convergence a doc-review loop has no natural stopping point
+otherwise.
