@@ -16,6 +16,15 @@ Give the recommendation and the reasoning; the user acts on it by picking the mo
 they start or continue a session. Say this explicitly in your answer — don't let it read
 like you're about to do something.
 
+**Stop after giving the diagnosis. Do not start the underlying task.** When this skill is
+invoked, its output *is* the deliverable — not a preamble to work you then launch into.
+Give the recommendation and stop your turn there, even if the task itself sounded clear and
+you could technically just start doing it. The user may want to switch models or effort
+first, and diving in removes that choice — it means the "wrong" model, the one this skill
+exists to steer away from, ends up doing the work anyway. Wait for the user's next message
+before touching the task, whether that message says to proceed on the current model or
+confirms they've switched.
+
 ## Adapt this to your own picker
 
 The tiers below (Haiku / Sonnet / Opus, with Low/Medium/High/Extra/Max/Ultracode effort
@@ -217,6 +226,9 @@ session.)
 If the task is a poor fit for the current session's model (e.g. you're running the top
 tier but this scores as a bottom-tier task), say so plainly rather than softening it —
 that's the whole reason this skill exists.
+
+End your turn immediately after this output. Do not follow it with "starting now" or any
+work on the underlying task — wait for the user to respond first.
 
 ## Dispatching to a local model
 
