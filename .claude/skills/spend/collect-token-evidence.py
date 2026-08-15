@@ -160,6 +160,15 @@ def parse_ts(s):
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
+def _num(x):
+    """A token-count field that isn't actually a number (wrong type, or a
+    string from a damaged line) should read as 0, not crash the arithmetic
+    three functions later. bool is deliberately excluded even though it's a
+    numeric subtype in Python -- a stray `true`/`false` in a token field is a
+    format error, not a token count."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
+
+
 def load_requests(path):
     """Return one record per API REQUEST (deduped on message.id), in order."""
     requests = OrderedDict()
@@ -171,14 +180,37 @@ def load_requests(path):
             entry = json.loads(raw)
         except json.JSONDecodeError:
             continue
+        # A line can be syntactically valid JSON and still not be the object
+        # shape this loop assumes -- a bare number, string, list, or null all
+        # parse cleanly. `entry.get(...)` on any of those raises AttributeError
+        # and used to take the whole run down over one damaged transcript line.
+        # Same risk one level down for message/usage/cache_creation/
+        # output_tokens_details and each content block, so check every one
+        # before calling .get() on it rather than trusting "or {}" -- that
+        # idiom only saves you from None/empty, not from the wrong type.
+        if not isinstance(entry, dict):
+            continue
         if entry.get("type") != "assistant":
             continue
-        msg = entry.get("message") or {}
-        mid = msg.get("id")
-        if not mid:
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
             continue
-        usage = msg.get("usage") or {}
-        cc = usage.get("cache_creation") or {}
+        mid = msg.get("id")
+        # A truthy but unhashable id (a list or dict, from a damaged line)
+        # would crash the very next line, requests.get(mid) -- str is what a
+        # real message id always is, so require it explicitly rather than
+        # just checking truthiness.
+        if not isinstance(mid, str):
+            continue
+        raw_usage = msg.get("usage")
+        usage_valid = isinstance(raw_usage, dict)
+        usage = raw_usage if usage_valid else {}
+        cc = usage.get("cache_creation")
+        if not isinstance(cc, dict):
+            cc = {}
+        otd = usage.get("output_tokens_details")
+        if not isinstance(otd, dict):
+            otd = {}
         rec = requests.get(mid)
         if rec is None:
             rec = {
@@ -188,18 +220,28 @@ def load_requests(path):
                 "effort": entry.get("effort"),
                 "skill": entry.get("attributionSkill"),
                 "sidechain": bool(entry.get("isSidechain")),
-                "input": usage.get("input_tokens") or 0,
-                "cache_write": usage.get("cache_creation_input_tokens") or 0,
-                "cache_write_5m": cc.get("ephemeral_5m_input_tokens") or 0,
-                "cache_write_1h": cc.get("ephemeral_1h_input_tokens") or 0,
-                "cache_read": usage.get("cache_read_input_tokens") or 0,
-                "output": usage.get("output_tokens") or 0,
-                "thinking": (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
+                "input": 0, "cache_write": 0, "cache_write_5m": 0, "cache_write_1h": 0,
+                "cache_read": 0, "output": 0, "thinking": 0,
                 "tools": [],
                 "_tool_ids": set(),
                 "blocks": 0,
             }
             requests[mid] = rec
+        # Usage should be identical across every streamed line for one message
+        # id (see the module docstring), so re-applying it on every valid line
+        # is harmless in the normal case -- and it means a damaged first
+        # snapshot (usage_valid False, so skipped here) doesn't permanently
+        # freeze this record at zero: a later line with real usage still
+        # populates it, instead of the record being created once from bad
+        # data and never touched again.
+        if usage_valid:
+            rec["input"] = _num(usage.get("input_tokens"))
+            rec["cache_write"] = _num(usage.get("cache_creation_input_tokens"))
+            rec["cache_write_5m"] = _num(cc.get("ephemeral_5m_input_tokens"))
+            rec["cache_write_1h"] = _num(cc.get("ephemeral_1h_input_tokens"))
+            rec["cache_read"] = _num(usage.get("cache_read_input_tokens"))
+            rec["output"] = _num(usage.get("output_tokens"))
+            rec["thinking"] = _num(otd.get("thinking_tokens"))
         # Content blocks are spread across lines: each line for this message id
         # is a snapshot, so the same tool_use block reappears on every later
         # line. Dedupe on the block's own id (unique per call), not on the tool
@@ -207,7 +249,12 @@ def load_requests(path):
         # (e.g. two Bash calls) must both count, and deduping by name alone
         # would silently collapse them into one.
         rec["blocks"] += 1
-        for block in msg.get("content") or []:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
                 tool_id = block.get("id")
                 name = block.get("name")
@@ -307,6 +354,26 @@ def analyze(session_file, include_subagents=True):
     startup = main_sorted[0]["cache_write"] if main_sorted else 0
     first_turn_uncached = main_sorted[0]["input"] if main_sorted else 0
 
+    # What later requests actually paid to carry the startup prefix. NOT a flat
+    # 0.1x on every one of them: the CACHE MISSES section above already shows
+    # some later requests paid write rates, not read rates, for their whole
+    # context -- startup included. Treating those as 0.1x reads too would
+    # understate exactly the expensive requests this skill exists to flag.
+    # A miss's blended write rate (its own wu / its own raw cache_write) is
+    # applied to the startup token count as the best available proxy for what
+    # portion of that rewrite was the startup prefix specifically.
+    miss_idx = {m["index"] for m in misses}
+    startup_reread_lo = startup_reread_hi = 0.0
+    for i, r in enumerate(main_sorted[1:], start=1):
+        if i in miss_idx and r["cache_write"] > 0:
+            rate_lo = r["cache_write_wu_lo"] / r["cache_write"]
+            rate_hi = r["cache_write_wu_hi"] / r["cache_write"]
+            startup_reread_lo += startup * rate_lo
+            startup_reread_hi += startup * rate_hi
+        else:
+            startup_reread_lo += startup * W_CACHE_READ
+            startup_reread_hi += startup * W_CACHE_READ
+
     totals = defaultdict(float)
     for r in reqs:
         for k in ("input", "cache_write", "cache_read", "output", "thinking", "wu",
@@ -337,7 +404,11 @@ def analyze(session_file, include_subagents=True):
         span = (ts[-1] - ts[0]).total_seconds()
 
     return {
-        "file": str(session_file),
+        # Deliberately no full filesystem path here -- it can carry a
+        # username or project name, and the privacy contract in SKILL.md is
+        # "nothing else" beyond counts, indices, model IDs, and tool names.
+        # `session` (the transcript's own UUID) is enough to identify which
+        # file this came from without leaking where it lives on disk.
         "session": session_file.stem,
         "requests": len(main),
         "subagent_requests": len(subs),
@@ -345,6 +416,8 @@ def analyze(session_file, include_subagents=True):
         "totals": dict(totals),
         "startup_tokens": startup,
         "first_turn_uncached_tokens": first_turn_uncached,
+        "startup_reread_lo": startup_reread_lo,
+        "startup_reread_hi": startup_reread_hi,
         "misses": misses,
         "curve": curve,
         "by_model": {k: dict(v) for k, v in by_model.items()},
@@ -398,7 +471,14 @@ def report(a):
         print(f"  {name:<14} {fmt(raw):>12} {w:>6.2f}x {fmt(wu):>12}  {share:>5.1f}%{tag}")
     print(f"  {'TOTAL':<14} {fmt(raw_total):>12} {'':>7} {fmt(t['wu']):>12}")
     if t["cache_write_unsplit"]:
-        lo_share = t["cache_write_wu_lo"] / t["wu"] * 100 if t["wu"] else 0
+        # t["wu"] is the session total under the HIGH-bound assumption (that's
+        # what weighted() and every other total in this report use). Reusing
+        # it as the denominator for the LOW share mixes scenarios: it asks
+        # "what fraction of the high-cost session would the low-cost write
+        # have been", not "what fraction of the low-cost session was it".
+        # Swap in the low-bound session total for that one figure.
+        lo_total = t["wu"] - t["cache_write_wu_hi"] + t["cache_write_wu_lo"]
+        lo_share = t["cache_write_wu_lo"] / lo_total * 100 if lo_total else 0
         hi_share = t["cache_write_wu_hi"] / t["wu"] * 100 if t["wu"] else 0
         print(f"  * {fmt(t['cache_write_unsplit'])} cache-write tokens came from older transcript entries "
               f"with no 5m/1h TTL recorded. True cost is unknown, not exact -- ranges "
@@ -413,10 +493,27 @@ def report(a):
     print("STARTUP")
     print(f"  cached prefix (system prompt, tools, skill listing): {fmt(a['startup_tokens'])} tokens")
     if a["requests"] > 1:
-        reread = a["startup_tokens"] * W_CACHE_READ * (a["requests"] - 1)
-        print(f"  re-read on each of the {a['requests']-1} later requests: ~{fmt(reread)} wu")
-        print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(1000 * W_CACHE_READ * (a['requests']-1))} wu "
-              f"at this session length, and more as sessions run longer")
+        lo, hi = a["startup_reread_lo"], a["startup_reread_hi"]
+        # Not a flat 0.1x times every later request -- see CACHE MISSES below.
+        # A request that missed the cache paid write rates for its whole
+        # context, startup prefix included, not the cheap read rate.
+        if lo == hi:
+            print(f"  paid again on each of the {a['requests']-1} later requests: ~{fmt(hi)} wu")
+        else:
+            print(f"  paid again on each of the {a['requests']-1} later requests: ~{fmt(lo)}-{fmt(hi)} wu "
+                  f"(range reflects an unsplit-TTL cache miss among them, see CACHE MISSES)")
+        if a["startup_tokens"]:
+            marginal_lo = lo / a["startup_tokens"] * 1000
+            marginal_hi = hi / a["startup_tokens"] * 1000
+            # A range above (lo != hi) means the same uncertainty applies to
+            # every derived figure, marginal savings included -- collapsing
+            # to hi-only here would silently undo the range just printed.
+            if marginal_lo == marginal_hi:
+                print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(marginal_hi)} wu "
+                      f"at this session's actual read/miss mix, and more as sessions run longer")
+            else:
+                print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(marginal_lo)}-{fmt(marginal_hi)} wu "
+                      f"at this session's actual read/miss mix, and more as sessions run longer")
     ftu = a["first_turn_uncached_tokens"]
     if ftu > 500:
         # Large and uncached on request #1 -- most likely the user's own first
