@@ -195,3 +195,19 @@ no compiler or test suite to converge against, so three of the five checks neede
 replacement (a rubric to check the draft against, a self-review pass) plus an added round-cap
 rule, since without a compiler forcing convergence a doc-review loop has no natural stopping point
 otherwise.
+
+**Two reviewer passes, then stop.** Both checklists above improve the draft the reviewer sees;
+neither bounds how many times it gets looked at, and "review until the reviewer stops finding
+things" is not a stopping rule — a reviewer re-reading a changed diff from scratch will nearly
+always find something. Decide the bound in advance instead: one inline review round on the PR at a
+frozen head SHA, every valid finding verified (a finding is a claim, not a fact), deduplicated by
+root cause and batched into a single correction pass, then merge. After merging, one holistic
+read-only acceptance audit of the exact merge commit, opened as an issue, ending in an explicit
+CLEAN or NOT CLEAN verdict. CLEAN closes the cycle. NOT CLEAN means one consolidated correction PR
+that runs the same cycle again, never a piecemeal fix-and-re-review loop. Multiple comments from
+one invocation are one round; fix commits answering them are not a new round; a second review
+invocation on the same PR is, and is prohibited by default. This also covers the fix commits, which
+are otherwise the least-reviewed code in the whole change. See
+[`docs/bounded-review-cycle.md`](docs/bounded-review-cycle.md), which carries the full method and
+the mechanical trap worth knowing up front: the audit spec goes in the issue *body*, but the
+reviewer has to be invoked in a separate *comment*, or the task may never start.

@@ -27,6 +27,7 @@ exact words.
 | [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
 | [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) | Five checks to run before requesting review, so common review-round-inflating mistakes get caught before an external reviewer sees the diff instead of after. |
 | [`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) | The same idea for a design or architecture doc instead of code — a doc has no compiler to converge against, so three of the five checks are doc-specific and there's an added round-cap rule. |
+| [`docs/bounded-review-cycle.md`](docs/bounded-review-cycle.md) | Both checklists improve the draft a reviewer sees; neither bounds how many times it gets looked at. This does: one inline review round on the PR, one holistic acceptance audit on an issue after merge, then the cycle is closed. Includes what counts as a "round" and the issue-trigger gotcha that stops the audit ever starting. |
 
 ## Quickstart
 
