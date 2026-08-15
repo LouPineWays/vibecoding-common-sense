@@ -42,19 +42,28 @@ done
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repository" >&2; exit 1; }
 
-# GNU `date -d` parses the same loose syntax git's --since accepts, so it doubles
-# as a validator; a malformed --since doesn't error inside git, it silently
-# matches nothing, which reads as an empty, healthy-looking window. BSD/macOS
-# `date` doesn't support -d, so this check is skipped there rather than made to
-# fail on a platform difference — better to under-validate than to false-positive.
-if date -d "$SINCE" >/dev/null 2>&1; then
-  : # parses fine
-elif command -v gdate >/dev/null 2>&1 && gdate -d "$SINCE" >/dev/null 2>&1; then
-  : # GNU coreutils installed under its usual macOS/Homebrew name
-elif date -d "30 days ago" >/dev/null 2>&1; then
-  # GNU date is present and rejected $SINCE outright — a real typo, not a
-  # syntax GNU date just doesn't happen to support.
-  echo "invalid --since value: '$SINCE'" >&2
+# A malformed --since doesn't error inside git, it silently matches nothing,
+# which reads as an empty, healthy-looking window — exactly the false-clean
+# result this whole script exists to prevent. The first attempt at catching
+# this relied on GNU `date -d` as a validator, but that's a no-op on stock
+# macOS (no GNU date, no gdate), which silently reintroduced the same bug on
+# exactly the platform most likely to hit it. Validating against git's own
+# date grammar isn't reliably possible from a portable shell script, so
+# instead this validates against a deliberately smaller grammar: every form
+# this skill's own defaults and docs actually use. Narrower than what git
+# accepts, but portable everywhere bash runs, and a value outside it fails
+# loudly instead of silently matching nothing.
+# The YYYY-MM-DD branch checks the month and day are in-range (01-12, 01-31),
+# not just that they're two digits — 0000-00-00 or 2026-00-00 matched a
+# digit-count-only pattern and reproduced the same silent-empty-report bug
+# this validator exists to close. Not a full calendar (Feb 30 still passes;
+# git itself doesn't reject it either, it rolls the date over instead of
+# erroring), but every all-zero or out-of-range typo that previously slipped
+# through is caught now.
+if ! printf '%s' "$SINCE" | grep -qiE '^[0-9]+[[:space:]]+(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)[[:space:]]+ago$' \
+  && ! printf '%s' "$SINCE" | grep -qiE '^(today|yesterday|now)$' \
+  && ! printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'; then
+  echo "invalid --since value: '$SINCE' — use a form like '30 days ago', '6 weeks ago', 'yesterday', or 2026-08-01" >&2
   exit 2
 fi
 
@@ -135,10 +144,17 @@ done
 echo
 echo "--- 5. hotspots: files touched by fix-shaped commits (repeat-patch signal) ---"
 echo "Count >= 3 is the 'stop and diagnose before patch three' threshold."
-HOTSPOTS=$(git log --no-merges --since="$SINCE" --format='%h%x09%s' "$REF" \
-  | grep -iE "$FIXWORDS" | cut -f1 \
-  | xargs -r -n1 git show --format='' --name-only 2>/dev/null \
-  | grep -v '^$' | sort | uniq -c | sort -rn | head -15)
+FIXSHAS=$(git log --no-merges --since="$SINCE" --format='%h%x09%s' "$REF" \
+  | grep -iE "$FIXWORDS" | cut -f1)
+# `xargs -r` (skip the command entirely on empty input) is a GNU extension;
+# BSD/macOS xargs doesn't support it and errors out. Checking for empty input
+# ourselves instead of relying on the flag works identically everywhere.
+if [ -n "$FIXSHAS" ]; then
+  HOTSPOTS=$(printf '%s\n' "$FIXSHAS" | xargs -n1 git show --format='' --name-only 2>/dev/null \
+    | grep -v '^$' | sort | uniq -c | sort -rn | head -15)
+else
+  HOTSPOTS=""
+fi
 if [ -n "$HOTSPOTS" ]; then echo "$HOTSPOTS"; else echo "(no fix-shaped commits in the window)"; fi
 
 echo
