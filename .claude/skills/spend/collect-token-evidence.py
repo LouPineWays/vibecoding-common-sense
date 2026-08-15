@@ -44,6 +44,7 @@ Stdlib only. No dependencies.
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections import Counter, OrderedDict, defaultdict
@@ -150,8 +151,9 @@ def parse_ts(s):
 
     Transcripts normally carry a trailing Z, but a naive timestamp from any
     source would make the sort raise `can't compare offset-naive and
-    offset-aware datetimes` and take the whole run down. Assume UTC."""
-    if not s:
+    offset-aware datetimes` and take the whole run down. Assume UTC. Also
+    guards against a non-string timestamp (an int, say) reaching .replace()."""
+    if not isinstance(s, str) or not s:
         return None
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -161,12 +163,46 @@ def parse_ts(s):
 
 
 def _num(x):
-    """A token-count field that isn't actually a number (wrong type, or a
-    string from a damaged line) should read as 0, not crash the arithmetic
-    three functions later. bool is deliberately excluded even though it's a
-    numeric subtype in Python -- a stray `true`/`false` in a token field is a
-    format error, not a token count."""
-    return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
+    """A token-count field that isn't a plausible token count -- wrong type,
+    negative, or non-finite (NaN/inf, which Python's json module accepts by
+    default even though the JSON spec doesn't allow them) -- reads as 0
+    instead of poisoning every downstream total, percentage, and sort. bool is
+    deliberately excluded even though it's a numeric subtype in Python -- a
+    stray `true`/`false` in a token field is a format error, not a count."""
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return 0
+    if not math.isfinite(x) or x < 0:
+        return 0
+    return x
+
+
+def _str(x):
+    """A field that must be a string to be used safely downstream (as a dict/
+    Counter key, or passed to a string method like .startswith()) -- anything
+    else becomes None so callers can fall back cleanly instead of crashing on
+    whatever shape a damaged line handed them."""
+    return x if isinstance(x, str) else None
+
+
+_USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens",
+                  "cache_read_input_tokens", "output_tokens")
+
+
+def _usage_quality(usage):
+    """How many of the four token-count fields this usage dict actually
+    carries as real numbers -- 0 to 4. Every line for one message id is
+    supposed to carry the same usage (see the module docstring's point 1),
+    so applying the latest snapshot is normally harmless. But "the same
+    dict is repeated" isn't guaranteed for a damaged line: a later `{}` or
+    a snapshot missing fields is still `isinstance(x, dict)` and would
+    otherwise overwrite a complete earlier one with zeros. Comparing
+    quality before applying stops a thinner snapshot from erasing a
+    fuller one, while still letting two equally complete snapshots that
+    genuinely differ take the later value."""
+    return sum(
+        1 for f in _USAGE_FIELDS
+        if isinstance(usage.get(f), (int, float)) and not isinstance(usage.get(f), bool)
+    )
 
 
 def load_requests(path):
@@ -216,25 +252,33 @@ def load_requests(path):
             rec = {
                 "id": mid,
                 "ts": parse_ts(entry.get("timestamp")),
-                "model": msg.get("model") or "unknown",
-                "effort": entry.get("effort"),
-                "skill": entry.get("attributionSkill"),
+                # _str() before the "or unknown"/plain assignment: a non-string
+                # model crashes model_weight()'s .startswith() later, and a
+                # non-string effort/skill crashes the Counter/dict-key use
+                # further down (both must be hashable *and* comparable the
+                # way real string values are).
+                "model": _str(msg.get("model")) or "unknown",
+                "effort": _str(entry.get("effort")),
+                "skill": _str(entry.get("attributionSkill")),
                 "sidechain": bool(entry.get("isSidechain")),
                 "input": 0, "cache_write": 0, "cache_write_5m": 0, "cache_write_1h": 0,
                 "cache_read": 0, "output": 0, "thinking": 0,
                 "tools": [],
                 "_tool_ids": set(),
+                "_usage_quality": 0,
                 "blocks": 0,
             }
             requests[mid] = rec
         # Usage should be identical across every streamed line for one message
-        # id (see the module docstring), so re-applying it on every valid line
-        # is harmless in the normal case -- and it means a damaged first
-        # snapshot (usage_valid False, so skipped here) doesn't permanently
-        # freeze this record at zero: a later line with real usage still
-        # populates it, instead of the record being created once from bad
-        # data and never touched again.
-        if usage_valid:
+        # id (see the module docstring), so applying whichever snapshot is at
+        # least as complete as what's already stored is harmless in the
+        # normal case -- and it means a damaged snapshot, first OR later,
+        # can't cost this record real data: a `{}` or a partial dict scores
+        # lower than a complete one and is skipped rather than applied, while
+        # a later line with real usage still populates (or replaces) a
+        # record that started from nothing or from something worse.
+        quality = _usage_quality(usage) if usage_valid else 0
+        if quality > 0 and quality >= rec["_usage_quality"]:
             rec["input"] = _num(usage.get("input_tokens"))
             rec["cache_write"] = _num(usage.get("cache_creation_input_tokens"))
             rec["cache_write_5m"] = _num(cc.get("ephemeral_5m_input_tokens"))
@@ -242,6 +286,7 @@ def load_requests(path):
             rec["cache_read"] = _num(usage.get("cache_read_input_tokens"))
             rec["output"] = _num(usage.get("output_tokens"))
             rec["thinking"] = _num(otd.get("thinking_tokens"))
+            rec["_usage_quality"] = quality
         # Content blocks are spread across lines: each line for this message id
         # is a snapshot, so the same tool_use block reappears on every later
         # line. Dedupe on the block's own id (unique per call), not on the tool
@@ -256,8 +301,12 @@ def load_requests(path):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use":
-                tool_id = block.get("id")
-                name = block.get("name")
+                # Both must be strings before either touches the set: an
+                # unhashable id (list/dict) crashes the membership check
+                # itself, and a non-string name would later crash formatting
+                # or Counter usage downstream.
+                tool_id = _str(block.get("id"))
+                name = _str(block.get("name"))
                 if name and tool_id and tool_id not in rec["_tool_ids"]:
                     rec["_tool_ids"].add(tool_id)
                     rec["tools"].append(name)
