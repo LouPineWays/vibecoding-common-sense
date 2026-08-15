@@ -53,9 +53,16 @@ git rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repository" >&2; ex
 # this skill's own defaults and docs actually use. Narrower than what git
 # accepts, but portable everywhere bash runs, and a value outside it fails
 # loudly instead of silently matching nothing.
+# The YYYY-MM-DD branch checks the month and day are in-range (01-12, 01-31),
+# not just that they're two digits — 0000-00-00 or 2026-00-00 matched a
+# digit-count-only pattern and reproduced the same silent-empty-report bug
+# this validator exists to close. Not a full calendar (Feb 30 still passes;
+# git itself doesn't reject it either, it rolls the date over instead of
+# erroring), but every all-zero or out-of-range typo that previously slipped
+# through is caught now.
 if ! printf '%s' "$SINCE" | grep -qiE '^[0-9]+[[:space:]]+(second|seconds|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)[[:space:]]+ago$' \
   && ! printf '%s' "$SINCE" | grep -qiE '^(today|yesterday|now)$' \
-  && ! printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+  && ! printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'; then
   echo "invalid --since value: '$SINCE' — use a form like '30 days ago', '6 weeks ago', 'yesterday', or 2026-08-01" >&2
   exit 2
 fi
