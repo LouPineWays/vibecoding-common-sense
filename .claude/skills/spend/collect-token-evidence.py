@@ -196,31 +196,54 @@ def load_requests(path):
                 "output": usage.get("output_tokens") or 0,
                 "thinking": (usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0,
                 "tools": [],
+                "_tool_ids": set(),
                 "blocks": 0,
             }
             requests[mid] = rec
-        # Content blocks are spread across lines; collect tool names from all of them.
+        # Content blocks are spread across lines: each line for this message id
+        # is a snapshot, so the same tool_use block reappears on every later
+        # line. Dedupe on the block's own id (unique per call), not on the tool
+        # name -- two distinct parallel calls to the same tool in one turn
+        # (e.g. two Bash calls) must both count, and deduping by name alone
+        # would silently collapse them into one.
         rec["blocks"] += 1
         for block in msg.get("content") or []:
             if block.get("type") == "tool_use":
+                tool_id = block.get("id")
                 name = block.get("name")
-                if name and name not in rec["tools"]:
+                if name and tool_id and tool_id not in rec["_tool_ids"]:
+                    rec["_tool_ids"].add(tool_id)
                     rec["tools"].append(name)
     return list(requests.values())
 
 
+def cache_write_wu_bounds(rec):
+    """Returns (low, high, unsplit_tokens) for the cache-write component alone.
+
+    Older transcripts may carry only the flat `cache_creation_input_tokens`
+    total with no 5m/1h split (`cache_creation` was added later). For that
+    unsplit remainder the TTL actually used is genuinely unknown -- guessing
+    either rate and presenting one number as measured spend is the error a
+    reviewer caught here. Report a range instead: low assumes every unsplit
+    token was a 5m write, high assumes every one was 1h. When nothing is
+    unsplit, low == high and the number is exact, not a bound."""
+    w5, w1 = rec["cache_write_5m"], rec["cache_write_1h"]
+    unsplit = max(0, rec["cache_write"] - w5 - w1)
+    known = w5 * W_CACHE_WRITE_5M + w1 * W_CACHE_WRITE_1H
+    return (known + unsplit * W_CACHE_WRITE_5M,
+            known + unsplit * W_CACHE_WRITE_1H,
+            unsplit)
+
+
 def weighted(rec):
-    w5 = rec["cache_write_5m"]
-    w1 = rec["cache_write_1h"]
-    # Older transcripts may carry the total without the TTL split. Attribute the
-    # remainder at the 1h rate: on subscriptions 1h is the default TTL, and
-    # over-stating is the safer error for a cost report.
-    split = w5 + w1
-    unsplit = max(0, rec["cache_write"] - split)
+    """Point estimate for a request's total cost. Uses the high bound (1h) for
+    any unsplit cache-write tokens, so this number over-states rather than
+    under-states when the true TTL mix is unknown -- see cache_write_wu_bounds
+    for the honest range, which the report prints separately when it matters."""
+    _, cache_write_hi, _ = cache_write_wu_bounds(rec)
     return (
         rec["input"] * W_INPUT
-        + w5 * W_CACHE_WRITE_5M
-        + (w1 + unsplit) * W_CACHE_WRITE_1H
+        + cache_write_hi
         + rec["cache_read"] * W_CACHE_READ
         + rec["output"] * W_OUTPUT
     )
@@ -239,6 +262,7 @@ def analyze(session_file, include_subagents=True):
         return None
 
     for r in reqs:
+        r["cache_write_wu_lo"], r["cache_write_wu_hi"], r["cache_write_unsplit"] = cache_write_wu_bounds(r)
         r["wu"] = weighted(r)
         mw = model_weight(r["model"])
         r["mw"] = mw
@@ -262,8 +286,10 @@ def analyze(session_file, include_subagents=True):
             cause = f"idle {gap/60:.0f} min (past 1h cache TTL)"
         elif gap is not None and gap > 300:
             cause = f"idle {gap/60:.0f} min (past 5m cache TTL)"
+        # Use the same high-bound point estimate as weighted() so this figure
+        # is consistent with the session total rather than a separate flat guess.
         misses.append({"index": i, "cause": cause, "rewrite_tokens": r["cache_write"],
-                       "wu": r["cache_write"] * W_CACHE_WRITE_1H, "gap_s": gap})
+                       "wu": r["cache_write_wu_hi"], "gap_s": gap})
 
     # --- context size per turn ------------------------------------------------
     # cache_read + cache_write is the whole prompt that went up on that request.
@@ -271,11 +297,20 @@ def analyze(session_file, include_subagents=True):
               "added": r["cache_write"], "tools": r["tools"], "model": r["model"]}
              for i, r in enumerate(main_sorted)]
 
-    startup = main_sorted[0]["cache_write"] + main_sorted[0]["input"] if main_sorted else 0
+    # cache_write on the first request is the stable prefix Claude Code marks
+    # with cache_control -- system prompt, tool schemas, skill listing -- and is
+    # genuinely fixed overhead paid before any work happens. `input` on that
+    # same request is whatever *wasn't* covered by a cache breakpoint, which is
+    # usually trivial but, if the user's first message is large and uncached,
+    # can BE that message. Keep them separate so a big first prompt is never
+    # mislabeled as trimmable startup configuration.
+    startup = main_sorted[0]["cache_write"] if main_sorted else 0
+    first_turn_uncached = main_sorted[0]["input"] if main_sorted else 0
 
     totals = defaultdict(float)
     for r in reqs:
-        for k in ("input", "cache_write", "cache_read", "output", "thinking", "wu"):
+        for k in ("input", "cache_write", "cache_read", "output", "thinking", "wu",
+                   "cache_write_wu_lo", "cache_write_wu_hi", "cache_write_unsplit"):
             totals[k] += r[k]
     totals["cwu"] = sum(r["cwu"] for r in reqs if r["cwu"] is not None)
     totals["cwu_complete"] = all(r["cwu"] is not None for r in reqs)
@@ -309,6 +344,7 @@ def analyze(session_file, include_subagents=True):
         "transcript_lines_assistant": sum(r["blocks"] for r in main),
         "totals": dict(totals),
         "startup_tokens": startup,
+        "first_turn_uncached_tokens": first_turn_uncached,
         "misses": misses,
         "curve": curve,
         "by_model": {k: dict(v) for k, v in by_model.items()},
@@ -340,19 +376,34 @@ def report(a):
     print()
 
     print("LEDGER (wu = weighted input-token equivalents; see header for weights)")
+    # Cache writes are a mix of 5m (1.25x) and 1h (2x) TTLs, so a single flat
+    # weight for the whole component would disagree with the session TOTAL
+    # (which is summed per-request from the real mix). Use the accumulated
+    # per-request wu here instead of raw * one weight, and derive an "effective"
+    # weight just for display.
+    cw_raw = t["cache_write"]
+    cw_wu = t["cache_write_wu_hi"]  # matches weighted()'s point estimate
+    cw_weight_display = cw_wu / cw_raw if cw_raw else W_CACHE_WRITE_1H
     rows = [
-        ("fresh input", t["input"], W_INPUT),
-        ("cache writes", t["cache_write"], W_CACHE_WRITE_1H),
-        ("cache reads", t["cache_read"], W_CACHE_READ),
-        ("output", t["output"], W_OUTPUT),
+        ("fresh input", t["input"], W_INPUT, t["input"] * W_INPUT),
+        ("cache writes", cw_raw, cw_weight_display, cw_wu),
+        ("cache reads", t["cache_read"], W_CACHE_READ, t["cache_read"] * W_CACHE_READ),
+        ("output", t["output"], W_OUTPUT, t["output"] * W_OUTPUT),
     ]
     raw_total = t["input"] + t["cache_write"] + t["cache_read"] + t["output"]
     print(f"  {'component':<14} {'raw tokens':>12} {'weight':>7} {'wu':>12}  {'share':>6}")
-    for name, raw, w in rows:
-        wu = raw * w
+    for name, raw, w, wu in rows:
         share = wu / t["wu"] * 100 if t["wu"] else 0
-        print(f"  {name:<14} {fmt(raw):>12} {w:>6.2f}x {fmt(wu):>12}  {share:>5.1f}%")
+        tag = "*" if name == "cache writes" and t["cache_write_unsplit"] else ""
+        print(f"  {name:<14} {fmt(raw):>12} {w:>6.2f}x {fmt(wu):>12}  {share:>5.1f}%{tag}")
     print(f"  {'TOTAL':<14} {fmt(raw_total):>12} {'':>7} {fmt(t['wu']):>12}")
+    if t["cache_write_unsplit"]:
+        lo_share = t["cache_write_wu_lo"] / t["wu"] * 100 if t["wu"] else 0
+        hi_share = t["cache_write_wu_hi"] / t["wu"] * 100 if t["wu"] else 0
+        print(f"  * {fmt(t['cache_write_unsplit'])} cache-write tokens came from older transcript entries "
+              f"with no 5m/1h TTL recorded. True cost is unknown, not exact -- ranges "
+              f"{fmt(t['cache_write_wu_lo'])}-{fmt(t['cache_write_wu_hi'])} wu ({lo_share:.1f}-{hi_share:.1f}% of "
+              f"session) depending on which TTL wrote them. Figures above use the high (1h) bound.")
     if t["thinking"] and t["output"]:
         print(f"  of output, {fmt(t['thinking'])} tokens ({t['thinking']/t['output']*100:.0f}%) were thinking")
     if t.get("cwu_complete") and len(a["by_model"]) > 1:
@@ -360,12 +411,23 @@ def report(a):
     print()
 
     print("STARTUP")
-    print(f"  first request carried {fmt(a['startup_tokens'])} tokens before you typed anything")
+    print(f"  cached prefix (system prompt, tools, skill listing): {fmt(a['startup_tokens'])} tokens")
     if a["requests"] > 1:
         reread = a["startup_tokens"] * W_CACHE_READ * (a["requests"] - 1)
         print(f"  re-read on each of the {a['requests']-1} later requests: ~{fmt(reread)} wu")
         print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(1000 * W_CACHE_READ * (a['requests']-1))} wu "
               f"at this session length, and more as sessions run longer")
+    ftu = a["first_turn_uncached_tokens"]
+    if ftu > 500:
+        # Large and uncached on request #1 -- most likely the user's own first
+        # message, not startup configuration. Don't attribute it to CLAUDE.md/MCP
+        # trimming: that's a different lever than "the prompt itself was long".
+        print(f"  + {fmt(ftu)} more tokens on that same request were NOT covered by a cache "
+              f"breakpoint -- most likely your first message itself, not fixed overhead. Not "
+              f"included above, and trimming CLAUDE.md/MCP servers won't touch it; if it needs "
+              f"cutting, that's shortening the prompt itself. Check with /context for the exact split.")
+    elif ftu:
+        print(f"  (+ {fmt(ftu)} uncached tokens on that request, not fixed overhead)")
     print()
 
     if a["misses"]:
