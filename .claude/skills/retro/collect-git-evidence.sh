@@ -29,14 +29,34 @@ BRANCH=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --since)  SINCE="${2:-}"; shift 2 ;;
-    --branch) BRANCH="${2:-}"; shift 2 ;;
+    --since)
+      [ $# -ge 2 ] || { echo "--since requires a value" >&2; exit 2; }
+      SINCE="$2"; shift 2 ;;
+    --branch)
+      [ $# -ge 2 ] || { echo "--branch requires a value" >&2; exit 2; }
+      BRANCH="$2"; shift 2 ;;
     -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repository" >&2; exit 1; }
+
+# GNU `date -d` parses the same loose syntax git's --since accepts, so it doubles
+# as a validator; a malformed --since doesn't error inside git, it silently
+# matches nothing, which reads as an empty, healthy-looking window. BSD/macOS
+# `date` doesn't support -d, so this check is skipped there rather than made to
+# fail on a platform difference — better to under-validate than to false-positive.
+if date -d "$SINCE" >/dev/null 2>&1; then
+  : # parses fine
+elif command -v gdate >/dev/null 2>&1 && gdate -d "$SINCE" >/dev/null 2>&1; then
+  : # GNU coreutils installed under its usual macOS/Homebrew name
+elif date -d "30 days ago" >/dev/null 2>&1; then
+  # GNU date is present and rejected $SINCE outright — a real typo, not a
+  # syntax GNU date just doesn't happen to support.
+  echo "invalid --since value: '$SINCE'" >&2
+  exit 2
+fi
 
 # Resolve the default branch rather than assuming main. origin/HEAD is only set
 # if someone ran `git remote set-head`, so fall back through the likely names and
@@ -58,6 +78,14 @@ fi
 REF="$BRANCH"
 git show-ref --verify --quiet "refs/remotes/origin/$BRANCH" && REF="origin/$BRANCH"
 
+# A mistyped --branch, or a repo with none of the usual default-branch names and
+# a detached HEAD, leaves REF pointing at nothing. Every section below pipes
+# `git log`'s exit code into `wc`/`sort`/etc, which always exits 0 — so an
+# unresolved REF would otherwise produce a silent, confident-looking empty
+# report instead of an error. Catch it once, here, rather than in nine places.
+git rev-parse --verify --quiet "$REF" >/dev/null \
+  || { echo "cannot resolve ref '$REF' (from --branch '$BRANCH') — check the branch name" >&2; exit 1; }
+
 FIXWORDS='\b(fix|fixes|fixed|bug|bugfix|hotfix|revert|reverts|regress|regression|broken|oops|typo)'
 
 echo "=== retro evidence ==="
@@ -78,7 +106,11 @@ echo
 echo "--- 2. landings without a PR reference (direct-to-default proxy) ---"
 echo "Non-merge commits on the default branch with no (#N) in the subject. On a"
 echo "squash-merge repo these are commits that never went through a PR. On a"
-echo "merge-commit repo, check them against section 4 before believing it."
+echo "merge-commit repo, check them against section 4 before believing it. On a"
+echo "rebase-merge repo this signal is unreliable in the other direction: reviewed"
+echo "commits land individually with no (#N) and no merge commit, so this section"
+echo "can flag ordinary reviewed work as unreviewed. Corroborate against the PR"
+echo "API before calling any of these unreviewed, not just this git layer alone."
 git log --first-parent --no-merges --since="$SINCE" --format='%h  %ad  %an  %s' --date=short "$REF" \
   | grep -vE '\(#[0-9]+\)' || echo "(none)"
 
@@ -88,14 +120,17 @@ git log --no-merges --since="$SINCE" --format='%h  %ad  %s' --date=short "$REF" 
   | grep -iE "$FIXWORDS" || echo "(none)"
 
 echo
-echo "--- 4. merge commits and their branch commit counts (review-round proxy) ---"
-echo "A high count means a branch that took many pushes to land. Empty on a"
-echo "squash-merge repo — that history is gone, so use the PR layer instead."
-git log --merges --since="$SINCE" --format='%h|%s' "$REF" 2>/dev/null | while IFS='|' read -r h s; do
+echo "--- 4. merge commits and their branch commit counts (review-round hint) ---"
+echo "This counts commits reachable on the branch, not pushes — a branch pushed"
+echo "once with eleven commits and one force-pushed eleven times down to one both"
+echo "read differently here. Treat a high count as 'worth checking the PR API for"
+echo "the real push/review-round count', not as review-round inflation on its own."
+echo "Empty on a squash-merge repo — that history is gone, use the PR layer instead."
+git log --merges --first-parent --since="$SINCE" --format='%h|%s' "$REF" 2>/dev/null | while IFS='|' read -r h s; do
   n=$(git rev-list --count "$h^1..$h^2" 2>/dev/null || echo '?')
   printf '%4s commits  %s  %s\n' "$n" "$h" "$s"
 done
-[ -z "$(git log --merges --since="$SINCE" --format='%h' "$REF" 2>/dev/null)" ] && echo "(no merge commits in window)"
+[ -z "$(git log --merges --first-parent --since="$SINCE" --format='%h' "$REF" 2>/dev/null)" ] && echo "(no merge commits in window)"
 
 echo
 echo "--- 5. hotspots: files touched by fix-shaped commits (repeat-patch signal) ---"

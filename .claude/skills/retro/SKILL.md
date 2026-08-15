@@ -80,16 +80,22 @@ false clean bill of health is the single most damaging thing this skill can prod
 The collector's sections map onto specific failure modes. The mapping is the point — a raw count
 is not a finding.
 
-- **§2, landings with no PR reference** → work reaching the default branch unreviewed. Weigh it
-  against the stakes from the scope check before calling it a defect.
+- **§2, landings with no PR reference** → work reaching the default branch unreviewed, on a
+  squash- or merge-commit repo. Weigh it against the stakes from the scope check before calling
+  it a defect. **On a rebase-merge repo this reads backwards** — reviewed commits land
+  individually with no `(#N)` and no merge commit, so §2 flags ordinary reviewed work as
+  unreviewed. Never call something unreviewed from this section alone; corroborate against the
+  PR layer first.
 - **§3 and §5, fix-shaped commits and the files they touch** → the repeat-patch loop. Three or
   more fix commits on one file in one window is the "stop and diagnose before patch three"
   threshold: probably not several bugs but one fragile design emitting a new symptom each round.
   The fix is rarely another patch; it's a fast local repro so attempts cost seconds, or a
   restructure.
-- **§4, commits per merged branch** → review-round inflation, on merge-commit repos. A branch
-  that took eleven pushes to land spent most of them answering review findings one at a time.
-  Squash-merge repos destroy this history, so get it from the PR layer or say you couldn't.
+- **§4, commits per merged branch** → a hint worth chasing on the PR layer, on merge-commit
+  repos, not a review-round count on its own. It's reachable commits, not pushes — one push of
+  eleven commits and eleven force-pushed rounds squashed down to one commit both read as "1" or
+  "11" independent of how many times review actually happened. Squash-merge repos destroy this
+  history entirely, so get the real number from the PR layer or say you couldn't.
 - **§7, reverts** → something shipped that shouldn't have. Always worth reading individually;
   the count matters less than what the revert says about how it got through.
 - **§8, unmerged branches** → abandoned work, and a branch-safety hazard. The risk isn't the
