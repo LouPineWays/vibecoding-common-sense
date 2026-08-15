@@ -25,6 +25,7 @@ exact words.
 | [`.claude/skills/sift/`](.claude/skills/sift/SKILL.md) | A skill that checks a repo before you adopt anything from it: whether you already have the capability somewhere in your own stack, whether the license actually allows what you want to do with it, and whether porting the one useful piece is even cheaper than writing it yourself. Ends in a verdict, not a vibe. |
 | [`.claude/skills/skill-observer/`](.claude/skills/skill-observer/SKILL.md) | A skill that logs it when one of your other skills gives wrong or stale instructions, so fixes accumulate in a plain file instead of getting lost. A small-repo alternative to [task-observer](https://github.com/rebelytics/one-skill-to-rule-them-all) (Eoghan Henn / rebelytics.com, CC BY 4.0) — same core idea, without the concurrency machinery a large skill library under heavy parallel use needs. |
 | [`.claude/skills/retro/`](.claude/skills/retro/SKILL.md) | A skill that reads your repo's own git and PR history for evidence of process failures — the same file patched three times, review rounds inflating, work landing unreviewed — and proposes at most three fixes, each moving one rule up exactly one rung from "written down" toward "a mechanism that can't be skipped". Caps the output on purpose: a retro that hands you ten things changes nothing. Ships a collector script so the two git incantations that silently inflate the numbers can't. |
+| [`.claude/skills/spend/`](.claude/skills/spend/SKILL.md) | A skill that reads a session's own transcript to find where the tokens actually went — the startup payload that gets re-read on every turn, a model switch that silently re-wrote the whole context, the one call that tripled the window everything after it pays for. Checks `/usage` and `/context` first and says so when a built-in already answers the question. Ships a collector script because three properties of the transcript format corrupt the numbers if you count by hand — one of them over-counts by 2.4x. |
 | [`scripts/watch-codex-review.sh`](scripts/watch-codex-review.sh) | Polls a PR for a review response (Codex or any other review-on-comment bot) so you don't have to keep re-checking it yourself. See "Waiting on a PR review" below. |
 | [`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) | Five checks to run before requesting review, so common review-round-inflating mistakes get caught before an external reviewer sees the diff instead of after. |
 | [`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) | The same idea for a design or architecture doc instead of code — a doc has no compiler to converge against, so three of the five checks are doc-specific and there's an added round-cap rule. |
@@ -35,7 +36,8 @@ exact words.
 1. Copy `CLAUDE.md.template` to `CLAUDE.md` at the root of your repo (and to `AGENTS.md`
    too, if you also run Codex against the same repo).
 2. Copy `.claude/skills/model-check/`, `.claude/skills/sift/`,
-   `.claude/skills/skill-observer/`, and `.claude/skills/retro/` into your own
+   `.claude/skills/skill-observer/`, `.claude/skills/retro/`, and
+   `.claude/skills/spend/` into your own
    `.claude/skills/` directory, and
    `scripts/watch-codex-review.sh` into your own repo (a top-level `scripts/` directory
    works, or wherever you keep repo tooling) — the copied `CLAUDE.md` references it by
