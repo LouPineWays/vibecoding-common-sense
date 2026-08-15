@@ -196,11 +196,15 @@ def load_requests(path):
         if not isinstance(msg, dict):
             continue
         mid = msg.get("id")
-        if not mid:
+        # A truthy but unhashable id (a list or dict, from a damaged line)
+        # would crash the very next line, requests.get(mid) -- str is what a
+        # real message id always is, so require it explicitly rather than
+        # just checking truthiness.
+        if not isinstance(mid, str):
             continue
-        usage = msg.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
+        raw_usage = msg.get("usage")
+        usage_valid = isinstance(raw_usage, dict)
+        usage = raw_usage if usage_valid else {}
         cc = usage.get("cache_creation")
         if not isinstance(cc, dict):
             cc = {}
@@ -216,18 +220,28 @@ def load_requests(path):
                 "effort": entry.get("effort"),
                 "skill": entry.get("attributionSkill"),
                 "sidechain": bool(entry.get("isSidechain")),
-                "input": _num(usage.get("input_tokens")),
-                "cache_write": _num(usage.get("cache_creation_input_tokens")),
-                "cache_write_5m": _num(cc.get("ephemeral_5m_input_tokens")),
-                "cache_write_1h": _num(cc.get("ephemeral_1h_input_tokens")),
-                "cache_read": _num(usage.get("cache_read_input_tokens")),
-                "output": _num(usage.get("output_tokens")),
-                "thinking": _num(otd.get("thinking_tokens")),
+                "input": 0, "cache_write": 0, "cache_write_5m": 0, "cache_write_1h": 0,
+                "cache_read": 0, "output": 0, "thinking": 0,
                 "tools": [],
                 "_tool_ids": set(),
                 "blocks": 0,
             }
             requests[mid] = rec
+        # Usage should be identical across every streamed line for one message
+        # id (see the module docstring), so re-applying it on every valid line
+        # is harmless in the normal case -- and it means a damaged first
+        # snapshot (usage_valid False, so skipped here) doesn't permanently
+        # freeze this record at zero: a later line with real usage still
+        # populates it, instead of the record being created once from bad
+        # data and never touched again.
+        if usage_valid:
+            rec["input"] = _num(usage.get("input_tokens"))
+            rec["cache_write"] = _num(usage.get("cache_creation_input_tokens"))
+            rec["cache_write_5m"] = _num(cc.get("ephemeral_5m_input_tokens"))
+            rec["cache_write_1h"] = _num(cc.get("ephemeral_1h_input_tokens"))
+            rec["cache_read"] = _num(usage.get("cache_read_input_tokens"))
+            rec["output"] = _num(usage.get("output_tokens"))
+            rec["thinking"] = _num(otd.get("thinking_tokens"))
         # Content blocks are spread across lines: each line for this message id
         # is a snapshot, so the same tool_use block reappears on every later
         # line. Dedupe on the block's own id (unique per call), not on the tool
@@ -489,9 +503,17 @@ def report(a):
             print(f"  paid again on each of the {a['requests']-1} later requests: ~{fmt(lo)}-{fmt(hi)} wu "
                   f"(range reflects an unsplit-TTL cache miss among them, see CACHE MISSES)")
         if a["startup_tokens"]:
-            marginal = hi / a["startup_tokens"] * 1000
-            print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(marginal)} wu "
-                  f"at this session's actual read/miss mix, and more as sessions run longer")
+            marginal_lo = lo / a["startup_tokens"] * 1000
+            marginal_hi = hi / a["startup_tokens"] * 1000
+            # A range above (lo != hi) means the same uncertainty applies to
+            # every derived figure, marginal savings included -- collapsing
+            # to hi-only here would silently undo the range just printed.
+            if marginal_lo == marginal_hi:
+                print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(marginal_hi)} wu "
+                      f"at this session's actual read/miss mix, and more as sessions run longer")
+            else:
+                print(f"  -> every 1,000 tokens trimmed here saves ~{fmt(marginal_lo)}-{fmt(marginal_hi)} wu "
+                      f"at this session's actual read/miss mix, and more as sessions run longer")
     ftu = a["first_turn_uncached_tokens"]
     if ftu > 500:
         # Large and uncached on request #1 -- most likely the user's own first
