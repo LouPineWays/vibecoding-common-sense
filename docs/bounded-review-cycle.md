@@ -136,8 +136,15 @@ citing the merge commit beats a checkbox someone ticked.
 1. Verify each finding against the audited merge commit.
 2. Reject false positives and duplicates.
 3. Settle any required owner decisions together, before editing.
-4. Batch every accepted finding into **one** new correction PR.
-5. Run that PR through this same cycle: one inline round, batch, verify, merge, one audit.
+4. **Check how many correction PRs this cycle has already made to the same file or function.** If
+   this is the third or later one, stop before writing the patch and run
+   [`pre-review-checklist.md`](pre-review-checklist.md)'s second-attempt and symptom-vs-rule
+   checks against it — a correction PR is exactly the case those two checks exist for, since the
+   code already failed at least one prior check to get here. Name the general shape of the failure
+   (see `CLAUDE.md.template`, "When one spot keeps needing fixes") before writing a fix that would
+   only be verified against the one case just reported.
+5. Batch every accepted finding into **one** new correction PR.
+6. Run that PR through this same cycle: one inline round, batch, verify, merge, one audit.
 
 Don't answer findings one at a time with repeated fix-and-re-review loops. That's the tennis match
 this doc exists to end, and it doesn't become acceptable just because an audit started it.
