@@ -162,26 +162,45 @@ def parse_ts(s):
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _num(x):
-    """A token-count field that isn't a plausible token count -- wrong type,
-    negative, or non-finite (NaN/inf, which Python's json module accepts by
-    default even though the JSON spec doesn't allow them) -- reads as 0
-    instead of poisoning every downstream total, percentage, and sort. bool is
-    deliberately excluded even though it's a numeric subtype in Python -- a
-    stray `true`/`false` in a token field is a format error, not a count.
-    An implausibly large int (no real token count needs more than a handful
-    of digits) is also treated as damaged -- math.isfinite() raises
-    OverflowError converting one to float rather than returning False, so it
-    has to be caught explicitly instead of being covered by the check below."""
+# No real token count is anywhere near this large -- the biggest context
+# windows in use are on the order of 10 million tokens, so this leaves five
+# orders of magnitude of headroom while still ruling out the kind of
+# implausible value (a damaged field, not a big session) that would
+# otherwise pass every other check and then overflow to inf once multiplied
+# by a component weight downstream.
+_MAX_PLAUSIBLE_TOKENS = 10**12
+
+
+def _is_valid_token_count(x):
+    """True if x is a single plausible token count: a non-bool int/float,
+    finite, non-negative, and under _MAX_PLAUSIBLE_TOKENS. This is the one
+    definition of "valid" shared by _num() (so a bad field reads as 0
+    instead of poisoning arithmetic downstream) and _usage_quality() (so a
+    field this implausible can't count as "valid" and let a corrupted
+    snapshot outscore a real one) -- the two used to disagree, which let a
+    NaN- or oversized-token snapshot win a quality tie it shouldn't have.
+    bool is deliberately excluded even though it's a numeric subtype in
+    Python -- a stray `true`/`false` in a token field is a format error, not
+    a count. math.isfinite() raises OverflowError converting an
+    implausibly large int to float rather than returning False, which the
+    ceiling check below makes moot, but the try/except stays as a guard
+    against that same overflow on values between the two checks."""
     if not isinstance(x, (int, float)) or isinstance(x, bool):
-        return 0
+        return False
     try:
         finite = math.isfinite(x)
     except OverflowError:
-        return 0
-    if not finite or x < 0:
-        return 0
-    return x
+        return False
+    return finite and 0 <= x <= _MAX_PLAUSIBLE_TOKENS
+
+
+def _num(x):
+    """A token-count field that isn't a plausible token count -- wrong type,
+    negative, non-finite (NaN/inf, which Python's json module accepts by
+    default even though the JSON spec doesn't allow them), or implausibly
+    large -- reads as 0 instead of poisoning every downstream total,
+    percentage, and sort."""
+    return x if _is_valid_token_count(x) else 0
 
 
 def _str(x):
@@ -195,21 +214,37 @@ def _str(x):
 _USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens",
                   "cache_read_input_tokens", "output_tokens")
 
+# The nested fields copied alongside the four top-level ones whenever a
+# snapshot is applied (see load_requests below) -- scored too, so a snapshot
+# that repairs a broken TTL split or thinking count actually outscores the
+# broken one instead of losing a tie on the four top-level fields alone.
+_NESTED_USAGE_PATHS = (
+    ("cache_creation", "ephemeral_5m_input_tokens"),
+    ("cache_creation", "ephemeral_1h_input_tokens"),
+    ("output_tokens_details", "thinking_tokens"),
+)
+
 
 def _usage_quality(usage):
-    """How many of the four token-count fields this usage dict actually
-    carries as real numbers -- 0 to 4. Every line for one message id is
-    supposed to carry the SAME usage (see the module docstring's point 1) --
-    there's no legitimate case where two snapshots for one id are both
-    complete but differ. So when a later snapshot ties the stored one on
-    quality, that tie is itself evidence the later line is the damaged one,
-    not a genuine update -- and the fix is to keep the existing snapshot,
-    not take the new one. Only a strictly higher-quality snapshot (partial
-    -> complete) should replace what's stored."""
-    return sum(
-        1 for f in _USAGE_FIELDS
-        if isinstance(usage.get(f), (int, float)) and not isinstance(usage.get(f), bool)
-    )
+    """How many of the seven token-count fields this usage dict actually
+    carries as plausible numbers -- 0 to 7 (four top-level, three nested).
+    Uses the same validity predicate as _num() -- a NaN, negative, or
+    implausibly large value doesn't count as "present" here either, so a
+    corrupted field can't inflate a damaged snapshot's score past a real
+    one's. Every line for one message id is supposed to carry the SAME
+    usage (see the module docstring's point 1) -- there's no legitimate
+    case where two snapshots for one id are both complete but differ. So
+    when a later snapshot ties the stored one on quality, that tie is
+    itself evidence the later line is the damaged one, not a genuine
+    update -- and the fix is to keep the existing snapshot, not take the
+    new one. Only a strictly higher-quality snapshot (partial -> complete,
+    or a repaired nested field) should replace what's stored."""
+    quality = sum(1 for f in _USAGE_FIELDS if _is_valid_token_count(usage.get(f)))
+    for outer, inner in _NESTED_USAGE_PATHS:
+        nested = usage.get(outer)
+        if isinstance(nested, dict) and _is_valid_token_count(nested.get(inner)):
+            quality += 1
+    return quality
 
 
 def load_requests(path):
