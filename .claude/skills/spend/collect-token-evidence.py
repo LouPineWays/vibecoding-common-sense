@@ -175,11 +175,10 @@ def _is_valid_token_count(x):
     """True if x is a single plausible token count: a non-bool int/float,
     finite, non-negative, and under _MAX_PLAUSIBLE_TOKENS. This is the one
     definition of "valid" shared by _num() (so a bad field reads as 0
-    instead of poisoning arithmetic downstream) and _usage_quality() (so a
-    field this implausible can't count as "valid" and let a corrupted
-    snapshot outscore a real one) -- the two used to disagree, which let a
-    NaN- or oversized-token snapshot win a quality tie it shouldn't have.
-    bool is deliberately excluded even though it's a numeric subtype in
+    instead of poisoning arithmetic downstream) and load_requests()'s
+    per-field fill-in (so a field this implausible can't count as "valid"
+    and be accepted over a missing or damaged stored value). bool is
+    deliberately excluded even though it's a numeric subtype in
     Python -- a stray `true`/`false` in a token field is a format error, not
     a count. math.isfinite() raises OverflowError converting an
     implausibly large int to float rather than returning False, which the
@@ -211,49 +210,20 @@ def _str(x):
     return x if isinstance(x, str) else None
 
 
-_USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens",
-                  "cache_read_input_tokens", "output_tokens")
-
-# The nested fields copied alongside the four top-level ones whenever a
-# snapshot is applied (see load_requests below) -- scored too, so a snapshot
-# that repairs a broken TTL split or thinking count actually outscores the
-# broken one instead of losing a tie on the four top-level fields alone.
-_NESTED_USAGE_PATHS = (
-    ("cache_creation", "ephemeral_5m_input_tokens"),
-    ("cache_creation", "ephemeral_1h_input_tokens"),
-    ("output_tokens_details", "thinking_tokens"),
+# Each usage field this collector tracks, and how to read it out of a
+# snapshot's (usage, cache_creation, output_tokens_details) triple. Walking
+# this list is how both the record's initial fields and every later
+# snapshot's fill-in are driven, so the two can't drift out of sync the way
+# a hand-written field-by-field block invited.
+_USAGE_PATHS = (
+    ("input", lambda usage, cc, otd: usage.get("input_tokens")),
+    ("cache_write", lambda usage, cc, otd: usage.get("cache_creation_input_tokens")),
+    ("cache_write_5m", lambda usage, cc, otd: cc.get("ephemeral_5m_input_tokens")),
+    ("cache_write_1h", lambda usage, cc, otd: cc.get("ephemeral_1h_input_tokens")),
+    ("cache_read", lambda usage, cc, otd: usage.get("cache_read_input_tokens")),
+    ("output", lambda usage, cc, otd: usage.get("output_tokens")),
+    ("thinking", lambda usage, cc, otd: otd.get("thinking_tokens")),
 )
-
-
-def _usage_quality(usage):
-    """(top_level_count, nested_count): how many of the four required
-    top-level fields are present as plausible numbers (0-4), and how many
-    of the three optional nested fields are (0-3). Kept as two numbers
-    compared lexicographically, not summed into one -- a snapshot missing a
-    top-level field is worse no matter how many nested fields it happens to
-    carry, so it must never outscore a snapshot with full top-level
-    coverage. Summing them let three repaired nested fields outweigh one
-    missing top-level field and replace a record's real input/cache/output
-    counts with zero.
-
-    Uses the same validity predicate as _num() -- a NaN, negative, or
-    implausibly large value doesn't count as "present" here either, so a
-    corrupted field can't inflate a damaged snapshot's score past a real
-    one's. Every line for one message id is supposed to carry the SAME
-    usage (see the module docstring's point 1) -- there's no legitimate
-    case where two snapshots for one id are both complete but differ. So
-    when a later snapshot ties the stored one, that tie is itself evidence
-    the later line is the damaged one, not a genuine update -- and the fix
-    is to keep the existing snapshot, not take the new one. Only a
-    strictly higher tuple (more top-level fields, or the same top-level
-    coverage plus a repaired nested field) should replace what's stored."""
-    top = sum(1 for f in _USAGE_FIELDS if _is_valid_token_count(usage.get(f)))
-    nested = 0
-    for outer, inner in _NESTED_USAGE_PATHS:
-        d = usage.get(outer)
-        if isinstance(d, dict) and _is_valid_token_count(d.get(inner)):
-            nested += 1
-    return (top, nested)
 
 
 def load_requests(path):
@@ -316,32 +286,32 @@ def load_requests(path):
                 "cache_read": 0, "output": 0, "thinking": 0,
                 "tools": [],
                 "_tool_ids": set(),
-                "_usage_quality": (0, 0),
+                "_usage_valid": {key: False for key, _ in _USAGE_PATHS},
                 "blocks": 0,
             }
             requests[mid] = rec
         # Usage should be identical across every streamed line for one message
-        # id (see the module docstring), so a later snapshot that's STRICTLY
-        # more complete than what's stored is a genuine upgrade (record
-        # started from nothing, or from a partial/damaged first line) and
-        # gets applied. A tie is not an upgrade -- per the invariant above,
-        # two genuinely-equal-quality snapshots should carry identical
-        # values, so a tie that would actually change the stored numbers is
-        # a damaged later line, not new information, and the first snapshot
-        # wins. Comparing (top, nested) lexicographically also means a
-        # snapshot missing a top-level field can never win on nested-field
-        # count alone -- it has to match or beat what's stored on top-level
-        # coverage first.
-        quality = _usage_quality(usage) if usage_valid else (0, 0)
-        if quality > (0, 0) and quality > rec["_usage_quality"]:
-            rec["input"] = _num(usage.get("input_tokens"))
-            rec["cache_write"] = _num(usage.get("cache_creation_input_tokens"))
-            rec["cache_write_5m"] = _num(cc.get("ephemeral_5m_input_tokens"))
-            rec["cache_write_1h"] = _num(cc.get("ephemeral_1h_input_tokens"))
-            rec["cache_read"] = _num(usage.get("cache_read_input_tokens"))
-            rec["output"] = _num(usage.get("output_tokens"))
-            rec["thinking"] = _num(otd.get("thinking_tokens"))
-            rec["_usage_quality"] = quality
+        # id (see the module docstring) -- there's no legitimate case where
+        # two snapshots for one id carry different values for the same
+        # field. So each field is filled in independently, at most once: the
+        # first snapshot to carry a plausible value for a given field wins
+        # it permanently, and a later snapshot can only fill in a field that
+        # is STILL missing, never overwrite one that already has a value --
+        # even if the later snapshot is otherwise more complete. That was
+        # exactly the previous bug: scoring the whole record by how many
+        # fields a snapshot carried let a snapshot that merely added a
+        # repaired nested field (say, thinking_tokens) also overwrite an
+        # already-trustworthy top-level field (input_tokens) with a
+        # different, damaged value, because the two were compared and
+        # applied as one unit instead of independently.
+        if usage_valid:
+            for key, extract in _USAGE_PATHS:
+                if rec["_usage_valid"][key]:
+                    continue
+                raw = extract(usage, cc, otd)
+                if _is_valid_token_count(raw):
+                    rec[key] = raw
+                    rec["_usage_valid"][key] = True
         # Content blocks are spread across lines: each line for this message id
         # is a snapshot, so the same tool_use block reappears on every later
         # line. Dedupe on the block's own id (unique per call), not on the tool
