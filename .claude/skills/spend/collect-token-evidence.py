@@ -225,6 +225,42 @@ _USAGE_PATHS = (
     ("thinking", lambda usage, cc, otd: otd.get("thinking_tokens")),
 )
 
+# The two parent/child aggregate relationships this collector's usage fields
+# carry: the TTL splits are parts of cache_write, and thinking is part of
+# output. _USAGE_PATHS validates each field as a plausible number on its
+# own, independently of the others -- that's correct for the field-overwrite
+# bug it was built to fix, but a value can be independently plausible and
+# still be inconsistent with the aggregate it's supposed to be a part of
+# (e.g. TTL splits summing to more than the cache-write total that was
+# accepted from a different, otherwise-undamaged snapshot). See
+# _enforce_usage_aggregates below for how this is checked.
+_USAGE_AGGREGATES = (
+    ("cache_write", ("cache_write_5m", "cache_write_1h")),
+    ("output", ("thinking",)),
+)
+
+
+def _enforce_usage_aggregates(rec):
+    """Discard a group of child fields if their parent aggregate was never
+    validly filled, or if they sum to more than it -- falling back to
+    "unsplit"/absent for that detail rather than reporting an internally
+    impossible record (cache-write wu computed from splits that exceed the
+    cache-write total; a thinking share above 100% of output). Mutates rec
+    in place.
+
+    This has to run once, after every line for a message id has been read
+    -- not inline as each field is filled -- because a parent and its
+    children can arrive on different streamed snapshots (see the per-field
+    fill-in loop above), so there's no single point during that loop where
+    "has the parent been decided yet" is answered for good."""
+    for parent, children in _USAGE_AGGREGATES:
+        parent_valid = rec["_usage_valid"][parent]
+        child_total = sum(rec[c] for c in children)
+        if not parent_valid or child_total > rec[parent]:
+            for c in children:
+                rec[c] = 0
+                rec["_usage_valid"][c] = False
+
 
 def load_requests(path):
     """Return one record per API REQUEST (deduped on message.id), in order."""
@@ -335,6 +371,8 @@ def load_requests(path):
                 if name and tool_id and tool_id not in rec["_tool_ids"]:
                     rec["_tool_ids"].add(tool_id)
                     rec["tools"].append(name)
+    for rec in requests.values():
+        _enforce_usage_aggregates(rec)
     return list(requests.values())
 
 
