@@ -226,25 +226,34 @@ _NESTED_USAGE_PATHS = (
 
 
 def _usage_quality(usage):
-    """How many of the seven token-count fields this usage dict actually
-    carries as plausible numbers -- 0 to 7 (four top-level, three nested).
+    """(top_level_count, nested_count): how many of the four required
+    top-level fields are present as plausible numbers (0-4), and how many
+    of the three optional nested fields are (0-3). Kept as two numbers
+    compared lexicographically, not summed into one -- a snapshot missing a
+    top-level field is worse no matter how many nested fields it happens to
+    carry, so it must never outscore a snapshot with full top-level
+    coverage. Summing them let three repaired nested fields outweigh one
+    missing top-level field and replace a record's real input/cache/output
+    counts with zero.
+
     Uses the same validity predicate as _num() -- a NaN, negative, or
     implausibly large value doesn't count as "present" here either, so a
     corrupted field can't inflate a damaged snapshot's score past a real
     one's. Every line for one message id is supposed to carry the SAME
     usage (see the module docstring's point 1) -- there's no legitimate
     case where two snapshots for one id are both complete but differ. So
-    when a later snapshot ties the stored one on quality, that tie is
-    itself evidence the later line is the damaged one, not a genuine
-    update -- and the fix is to keep the existing snapshot, not take the
-    new one. Only a strictly higher-quality snapshot (partial -> complete,
-    or a repaired nested field) should replace what's stored."""
-    quality = sum(1 for f in _USAGE_FIELDS if _is_valid_token_count(usage.get(f)))
+    when a later snapshot ties the stored one, that tie is itself evidence
+    the later line is the damaged one, not a genuine update -- and the fix
+    is to keep the existing snapshot, not take the new one. Only a
+    strictly higher tuple (more top-level fields, or the same top-level
+    coverage plus a repaired nested field) should replace what's stored."""
+    top = sum(1 for f in _USAGE_FIELDS if _is_valid_token_count(usage.get(f)))
+    nested = 0
     for outer, inner in _NESTED_USAGE_PATHS:
-        nested = usage.get(outer)
-        if isinstance(nested, dict) and _is_valid_token_count(nested.get(inner)):
-            quality += 1
-    return quality
+        d = usage.get(outer)
+        if isinstance(d, dict) and _is_valid_token_count(d.get(inner)):
+            nested += 1
+    return (top, nested)
 
 
 def load_requests(path):
@@ -307,7 +316,7 @@ def load_requests(path):
                 "cache_read": 0, "output": 0, "thinking": 0,
                 "tools": [],
                 "_tool_ids": set(),
-                "_usage_quality": 0,
+                "_usage_quality": (0, 0),
                 "blocks": 0,
             }
             requests[mid] = rec
@@ -319,9 +328,12 @@ def load_requests(path):
         # two genuinely-equal-quality snapshots should carry identical
         # values, so a tie that would actually change the stored numbers is
         # a damaged later line, not new information, and the first snapshot
-        # wins.
-        quality = _usage_quality(usage) if usage_valid else 0
-        if quality > 0 and quality > rec["_usage_quality"]:
+        # wins. Comparing (top, nested) lexicographically also means a
+        # snapshot missing a top-level field can never win on nested-field
+        # count alone -- it has to match or beat what's stored on top-level
+        # coverage first.
+        quality = _usage_quality(usage) if usage_valid else (0, 0)
+        if quality > (0, 0) and quality > rec["_usage_quality"]:
             rec["input"] = _num(usage.get("input_tokens"))
             rec["cache_write"] = _num(usage.get("cache_creation_input_tokens"))
             rec["cache_write_5m"] = _num(cc.get("ephemeral_5m_input_tokens"))
