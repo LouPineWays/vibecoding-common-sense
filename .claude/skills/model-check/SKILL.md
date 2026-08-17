@@ -116,6 +116,27 @@ files getting the same mechanical treatment, a batch of self-contained drafts. P
 anything where step two depends on step one's answer, or where the orchestrator would have
 to paste most of its own context into every worker anyway.
 
+**Named pattern: propagating one artifact (a skill, hook, doc, config file) from a source
+repo into N target repos.** Split it in two. Keep the *decision* phase — what to copy,
+whether each target's structure actually matches closely enough to edit analogously,
+whether anything conflicts or has diverged too far to port cleanly — in the orchestrator,
+scored normally by the five axes below; that's real judgment, and even though the targets
+are independent, the reasoning benefits from one continuous context. Once that phase
+produces a fixed, concrete plan ("copy these exact files to these exact paths, add this
+manifest entry, add this trigger line"), fan out **one subagent per target repo** for the
+mechanical copy/register/commit execution, typically at Medium effort — each worker only
+needs the fixed plan and its own repo's existing structure, not the orchestrator's
+investigation history, so the "paste most of its own context into every worker anyway"
+poor fit above doesn't apply. Two things stay with the orchestrator, not the workers:
+source-side registration when the source repo is itself parity-tracked rather than a leaf
+(propagation between two manifest-carrying repos updates *both* sides' manifests, so a
+target-only worker has no way to make that edit), and the push/PR step — this project's
+stop-before-push rule applies per branch same as anywhere else, so a worker's actual
+endpoint is a ready commit, not a push. Evidence: a real two-repo propagation task run as
+one continuous thread cost ~49% of that session's total token spend, almost all of it in
+the mechanical-execution half — re-reading accumulating git/edit/commit output on every
+subsequent turn, not any single oversized call.
+
 Frame it honestly as **parallelism with a modest token discount, not quota relief** —
 subagents spawned this way typically draw on the same account or quota as the parent
 session. When the actual constraint is a shared rate limit rather than wall-clock time, a
