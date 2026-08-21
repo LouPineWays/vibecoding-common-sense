@@ -97,15 +97,26 @@ A raw count is not a finding. The mapping is the point.
 - **Cache misses** (`CACHE MISSES`) → a request that re-wrote the entire context at write rates.
   The collector names the probable cause. **Switching models mid-session is the one people don't
   expect**: caches are model-scoped, so `/model` costs a full context rewrite. Idle gaps past the
-  cache TTL do the same. **`AskUserQuestion` is a third, less obvious source**: the collector logs
-  it as a model switch (`claude-sonnet-5` → `<synthetic>` → `claude-sonnet-5`), and it costs a full
-  write-rate rewrite the same way `/model` does — confirmed 2026-08-20 in a Covenant session
-  (request #21, 130,006 tokens rewritten, 260,012 wu, immediately after the turn's first
-  `AskUserQuestion` call). Not a reason to ask fewer necessary questions — a genuine stopping point
-  stays a stopping point — but the cost scales with context size at ask-time, so a founder-decision
-  gate asked early in a long-running task (while context is still small) is cheap, and the same
-  question asked late is not. Lever: choose the model before the context is large, front-load
-  `AskUserQuestion` calls when a task is expected to need one, or `/clear` first.
+  cache TTL do the same. **A `<synthetic>` model hop is a third, less obvious source, and it is not
+  specific to one tool**: the collector logs it as a model switch (`claude-sonnet-5` → `<synthetic>`
+  → `claude-sonnet-5`) because Claude Code's own client writes `<synthetic>` as `message.model` on
+  any locally-generated assistant turn that never made a real API call — confirmed from the client
+  source to cover several distinct cases, including a message-history repair step that fires
+  whenever the reconstructed conversation ends on a turn with no assistant reply yet (which is
+  exactly what an `AskUserQuestion` answer or a local slash command's output looks like at that
+  point), plus subagent-completion summaries and genuine API errors (rate limit, timeout,
+  context-window-exceeded). Whichever one fires, the next real request pays a full write-rate
+  rewrite the same way `/model` does. Confirmed in two independent Covenant sessions: 2026-08-20,
+  request #21, 130,006 tokens rewritten (260,012 wu), immediately after that turn's first
+  `AskUserQuestion` call; and 2026-08-21 (session `512c543b-caf3-56a7-808d-2158e0e53b57`), request
+  #83, 181,289 tokens rewritten (362,578 wu, 14.4% of that session's spend), with no
+  `AskUserQuestion` call anywhere in the session — the `<synthetic>` hop landed at the same turn
+  boundary as three local slash commands (`/context`, `/usage`, `/spend`) run back to back. Not a
+  reason to ask fewer necessary questions or avoid local commands — a genuine stopping point stays
+  a stopping point — but the cost scales with context size at the moment the hop happens, so doing
+  either early in a long-running task (while context is still small) is cheap, and doing either late
+  is not. Lever: choose the model before the context is large, front-load `AskUserQuestion` calls
+  and batches of local slash commands when a task is expected to need them, or `/clear` first.
 - **A single large jump in `CONTEXT GROWTH`** → one call that everything afterward pays interest
   on. A skill body, an unfiltered log or build output, a wide file read. Levers, in order of
   power: a `PreToolUse` hook that filters the output before it's ever seen; delegating the verbose
