@@ -119,17 +119,10 @@ can be completely correct and the loop still never converges, because "correct f
 reported case" and "correct in general" are different claims.
 
 This exact loop happened building the review-watcher script in this pack
-(`scripts/watch-codex-review.sh`): getting "poll for a bot's response within a timeout,
-without polling forever or missing the answer" right took roughly twenty rounds of
-automated review before anyone stopped to name what was actually happening. Most of those
-rounds were narrow, verified, genuinely-correct fixes to the *one case just reported* —
-and nearly all of them were the same underlying defect wearing a new trigger: a function
-that discarded already-successful partial work the moment any one step inside it failed,
-whether that step failed from a budget check, a timeout, or a real error. Patch after patch
-closed the specific trigger without ever asking "what's the general version of this
-failure?" The loop only ended once someone stepped back and asked that question directly,
-then made failure non-fatal to already-completed work as a structural rule, instead of
-special-casing the next way a step could fail.
+(`scripts/watch-codex-review.sh`): getting its polling behavior right took roughly twenty
+rounds of narrow, verified fixes before anyone noticed they were all the same underlying
+defect wearing a new trigger. See [`docs/review-loop-case-study.md`](docs/review-loop-case-study.md)
+for the full account.
 
 Two things to actually do differently once you notice you're in this loop:
 
@@ -145,10 +138,6 @@ Two things to actually do differently once you notice you're in this loop:
   minutes each. Still paying the external round-trip tax for iteration five is itself a
   sign you're testing symptoms, not the actual fix.
 
-For the longer version of this exact story — what the ~20 narrow-fix rounds actually looked
-like before anyone stopped to diagnose, and four more concrete techniques for cutting the
-round count next time — see [`docs/review-loop-case-study.md`](docs/review-loop-case-study.md).
-
 ## Multi-agent collaboration
 
 If you use more than one AI coding tool against this repo (Claude Code, Codex, others),
@@ -162,10 +151,8 @@ decide and write down who's better suited to what, rather than re-deciding it ev
 
 **A second, independent reviewer on every PR that touches real application code is worth
 defaulting to, not reserving for changes that look risky at a glance.** A routine-looking
-PR is exactly the kind that slips through unreviewed — plenty of real projects have shipped
-a PR with zero review that turned out to carry several correctness bugs, caught only in a
-retrospective sweep well after release. Skip the extra review only for changes that can't
-ship a user-facing bug (docs, tooling config, content edits).
+PR is exactly the kind that slips through unreviewed. Skip the extra review only for
+changes that can't ship a user-facing bug (docs, tooling config, content edits).
 
 When kicking off a task on a second agent, give it purpose and hard constraints, let it
 propose its own plan, review the plan before it touches code, then review the diff after —
@@ -174,40 +161,23 @@ change you wrote yourself.
 
 **Requesting a review always means starting the watcher in the same step, not just posting
 the comment and moving on.** `scripts/watch-codex-review.sh <owner/repo> <pr-number>
---trigger` (in this pack) posts the review-request comment and then polls for the response,
-exiting the moment a new review, inline comment, or clean-pass comment shows up — that's the
-default way to request review. Only drop `--trigger` when review was already requested some
-other way (opening the PR, marking a draft ready, a comment posted outside this flow);
-passing `--trigger` when a request is already in flight re-posts the comment and can trigger
-a duplicate response.
+--trigger` (in this pack) posts the review-request comment and polls for the response. Only
+drop `--trigger` when review was already requested some other way (opening the PR, marking a
+draft ready, a comment posted outside this flow); passing `--trigger` when a request is
+already in flight re-posts the comment and can trigger a duplicate response.
 
-**Before requesting that review, run the pre-flight checklist, not just the diff.** The
-"stop and diagnose" rule above is the reactive version of this lesson — what to do once you're
-already a few patches deep into the same spot. This is the proactive version: five checks, run
-before the first review request goes out, that catch the same failure modes before an external
-reviewer ever sees the diff instead of after round two or three. See
-[`docs/pre-review-checklist.md`](docs/pre-review-checklist.md) — especially before re-requesting
-review on a function you've already touched once for a finding.
+**Before requesting that review, run the pre-flight checklist, not just the diff.** See
+[`docs/pre-review-checklist.md`](docs/pre-review-checklist.md).
 
 **For a design or architecture doc instead of code, use
-[`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) instead.** Same idea, but a doc has
-no compiler or test suite to converge against, so three of the five checks needed a doc-specific
-replacement (a rubric to check the draft against, a self-review pass) plus an added round-cap
-rule, since without a compiler forcing convergence a doc-review loop has no natural stopping point
-otherwise.
+[`docs/doc-review-checklist.md`](docs/doc-review-checklist.md) instead.**
 
-**Two reviewer passes, then stop.** Both checklists above improve the draft the reviewer sees;
-neither bounds how many times it gets looked at, and "review until the reviewer stops finding
-things" is not a stopping rule — a reviewer re-reading a changed diff from scratch will nearly
-always find something. Decide the bound in advance instead: one inline review round on the PR at a
-frozen head SHA, every valid finding verified (a finding is a claim, not a fact), deduplicated by
-root cause and batched into a single correction pass, then merge. After merging, one holistic
-read-only acceptance audit of the exact merge commit, opened as an issue, ending in an explicit
-CLEAN or NOT CLEAN verdict. CLEAN closes the cycle. NOT CLEAN means one consolidated correction PR
-that runs the same cycle again, never a piecemeal fix-and-re-review loop. Multiple comments from
-one invocation are one round; fix commits answering them are not a new round; a second review
-invocation on the same PR is, and is prohibited by default. This also covers the fix commits, which
-are otherwise the least-reviewed code in the whole change. See
-[`docs/bounded-review-cycle.md`](docs/bounded-review-cycle.md), which carries the full method and
-the mechanical trap worth knowing up front: the audit spec goes in the issue *body*, but the
-reviewer has to be invoked in a separate *comment*, or the task may never start.
+**Two reviewer passes, then stop.** Decide the bound in advance: one inline review round on
+the PR at a frozen head SHA, every valid finding verified, deduplicated by root cause and
+batched into a single correction pass, then merge. After merging, one holistic read-only
+acceptance audit of the exact merge commit, opened as an issue, ending in an explicit CLEAN
+or NOT CLEAN verdict. CLEAN closes the cycle; NOT CLEAN means one consolidated correction PR
+that runs the same cycle again, never a piecemeal fix-and-re-review loop. Multiple comments
+from one invocation are one round; fix commits answering them are not a new round; a second
+review invocation on the same PR is, and is prohibited by default. See
+[`docs/bounded-review-cycle.md`](docs/bounded-review-cycle.md) for the full method.
