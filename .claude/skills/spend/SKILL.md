@@ -97,7 +97,15 @@ A raw count is not a finding. The mapping is the point.
 - **Cache misses** (`CACHE MISSES`) → a request that re-wrote the entire context at write rates.
   The collector names the probable cause. **Switching models mid-session is the one people don't
   expect**: caches are model-scoped, so `/model` costs a full context rewrite. Idle gaps past the
-  cache TTL do the same. Lever: choose the model before the context is large, or `/clear` first.
+  cache TTL do the same. **`AskUserQuestion` is a third, less obvious source**: the collector logs
+  it as a model switch (`claude-sonnet-5` → `<synthetic>` → `claude-sonnet-5`), and it costs a full
+  write-rate rewrite the same way `/model` does — confirmed 2026-08-20 in a Covenant session
+  (request #21, 130,006 tokens rewritten, 260,012 wu, immediately after the turn's first
+  `AskUserQuestion` call). Not a reason to ask fewer necessary questions — a genuine stopping point
+  stays a stopping point — but the cost scales with context size at ask-time, so a founder-decision
+  gate asked early in a long-running task (while context is still small) is cheap, and the same
+  question asked late is not. Lever: choose the model before the context is large, front-load
+  `AskUserQuestion` calls when a task is expected to need one, or `/clear` first.
 - **A single large jump in `CONTEXT GROWTH`** → one call that everything afterward pays interest
   on. A skill body, an unfiltered log or build output, a wide file read. Levers, in order of
   power: a `PreToolUse` hook that filters the output before it's ever seen; delegating the verbose
